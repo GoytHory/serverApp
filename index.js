@@ -11,22 +11,47 @@ const io = new Server(server, {
     methods: ["GET", "POST"]
   }
 });
+const mongoose = require('mongoose');
 
-io.on('connection', (socket) => {
+// Вставь сюда свою ссылку из скриншота, заменив пароль!
+const mongoURI = process.env.MONGODB_URI;
+
+mongoose.connect(mongoURI)
+  .then(() => console.log('Успешно подключено к MongoDB!'))
+  .catch(err => console.error('Ошибка подключения к базе:', err));
+
+// Создаем "Схему" — как будет выглядеть сообщение в базе
+const messageSchema = new mongoose.Schema({
+  user: String,
+  text: String,
+  timestamp: { type: Date, default: Date.now }
+});
+
+// Создаем модель
+const Message = mongoose.model('Message', messageSchema);
+
+io.on('connection', async (socket) => {
   console.log('КТО-ТО ПОДКЛЮЧИЛСЯ! ID:', socket.id);
+  const history = await Message.find().sort({ timestamp: 1 }).limit(50);
 
-  socket.on('message', (data) => {
-    console.log('--- НОВОЕ СООБЩЕНИЕ ---');
-    console.log('От кого:', data.senderName);
-    console.log('Текст:', data.text);
-    
-    // Чтобы сообщение увидели ВСЕ, сервер должен его переслать обратно
-    io.emit('message', data); 
+  socket.on('message', async (data) => {
+  // 1. Создаем объект сообщения на основе нашей модели
+  const newMessage = new Message({
+    user: data.user,
+    text: data.text
   });
+
+  // 2. Сохраняем в облако MongoDB
+  await newMessage.save();
+
+  // 3. Рассылаем всем остальным (как и было раньше)
+  io.emit('message', data);
+});
 
   socket.on('disconnect', () => {
     console.log('Юзер ушел');
   });
+  socket.emit('history', history);
 });
 
 // ВХОД: Берем порт, который даст Render, или 3000, если запускаем дома
