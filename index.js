@@ -63,7 +63,7 @@ io.on('connection', async (socket) => { // Добавили async сюда
   socket.on('disconnect', () => {
     console.log('Юзер ушел');
   });
-  socket.emit('history', history);
+  
 });
 
 // ВХОД: Берем порт, который даст Render, или 3000, если запускаем дома
