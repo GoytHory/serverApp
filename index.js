@@ -31,8 +31,14 @@ const messageSchema = new mongoose.Schema({
 const Message = mongoose.model('Message', messageSchema);
 
 io.on('connection', async (socket) => {
-  console.log('КТО-ТО ПОДКЛЮЧИЛСЯ! ID:', socket.id);
-  const history = await Message.find().sort({ timestamp: 1 }).limit(50);
+  try {
+    // Вытягиваем последние 50 сообщений
+    const history = await Message.find().sort({ timestamp: 1 }).limit(50);
+    // Отправляем конкретному сокету (тому, кто только что подключился)
+    socket.emit('history', history);
+  } catch (err) {
+    console.log('Ошибка при загрузке истории:', err);
+  }
 
   socket.on('message', async (data) => {
   // 1. Создаем объект сообщения на основе нашей модели
