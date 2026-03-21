@@ -89,4 +89,15 @@ io.on('connection', async (socket) => {
   });
 });
 
-// 6. Запуск сервера на порту (Render
+// 6. Запуск сервера на порту (Render сам назначит PORT, либо 3000 локально)
+const PORT = process.env.PORT || 3000;
+
+// Специальный адрес для проверки работоспособности (Health Check)
+app.get('/keep-alive', (req, res) => {
+  res.status(200).send('Server is running');
+});
+
+// Слушаем на 0.0.0.0, чтобы Render мог "видеть" сервер снаружи
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Сервер запущен и готов к работе на порту ${PORT}`);
+});
