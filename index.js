@@ -32,6 +32,12 @@ io.on('connection', (socket) => {
 // ВХОД: Берем порт, который даст Render, или 3000, если запускаем дома
 const PORT = process.env.PORT || 3000;
 
+// Специальный адрес для "будильника"
+app.get('/keep-alive', (req, res) => {
+  console.log('Кто-то постучал! Не сплю.');
+  res.status(200).send('I am alive');
+});
+
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Сервер запущен на порту ${PORT}`);
 });
