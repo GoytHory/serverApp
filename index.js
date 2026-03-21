@@ -30,15 +30,21 @@ const messageSchema = new mongoose.Schema({
 // Создаем модель
 const Message = mongoose.model('Message', messageSchema);
 
-io.on('connection', async (socket) => {
+io.on('connection', async (socket) => { // Добавили async сюда
+  console.log('Пользователь подключился');
+
   try {
-    // Вытягиваем последние 50 сообщений
-    const history = await Message.find().sort({ timestamp: 1 }).limit(50);
-    // Отправляем конкретному сокету (тому, кто только что подключился)
-    socket.emit('history', history);
+    // 1. Достаем историю из базы (Message - это твоя модель)
+    const historyData = await Message.find().sort({ timestamp: 1 }).limit(50);
+    
+    // 2. Отправляем её ТОЛЬКО этому пользователю
+    // Важно: имя переменной должно совпадать!
+    socket.emit('history', historyData); 
+    
   } catch (err) {
-    console.log('Ошибка при загрузке истории:', err);
+    console.error('Ошибка при загрузке истории:', err);
   }
+
 
   socket.on('message', async (data) => {
   // 1. Создаем объект сообщения на основе нашей модели
