@@ -43,6 +43,13 @@ const userSchema = new mongoose.Schema({
   createdAt: {
     type: Date,
     default: Date.now // JavaScript сам подставит текущее время в момент создания.
+  },
+
+  // ПОЛЕ: Статус (В сети / Не в сети)
+  status: {
+    type: String,
+    enum: ['online', 'offline'],
+    default: 'offline'
   }
 
   // СОВЕТ ПО УЛУЧШЕНИЮ (ПРО ID):
@@ -56,19 +63,6 @@ const userSchema = new mongoose.Schema({
   // Эта настройка убирает лишнее поле "__v" (версия документа), которое MongoDB лепит по умолчанию.
   versionKey: false 
 });
-
-// ПОЛЕ: Статус (В сети / Не в сети)
-  status: { 
-    type: String, 
-    // ENUM (Перечисление) — это "жесткий список" разрешенных слов.
-    // Если ты попытаешься записать в статус слово "eating" или "sleeping", 
-    // база выдаст ошибку. Разрешены ТОЛЬКО 'online' или 'offline'.
-    // ЗАЧЕМ: Чтобы в коде не было хаоса и опечаток типа 'onlline'.
-    enum: ['online', 'offline'], 
-    
-    // По умолчанию, когда человек только зарегистрировался, он 'offline'.
-    default: 'offline' 
-  },: { type: String, enum: ['online', 'offline'], default: 'offline' }
 
 // Экспортируем (выносим наружу) эту модель под именем 'User'.
 // Теперь в любом другом файле мы сможем написать "require('./models/User')" 
