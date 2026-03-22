@@ -7,6 +7,8 @@ const mongoose = require('mongoose');
 const app = express();
 const server = http.createServer(app);
 
+app.use(express.json());
+
 // 2. Настройка Socket.io с CORS для работы с мобильными устройствами
 const io = new Server(server, {
   cors: {
@@ -31,6 +33,62 @@ const messageSchema = new mongoose.Schema({
 });
 
 const Message = mongoose.model('Message', messageSchema);
+
+
+/////////////////////////////////////////
+
+/**
+ * 1. ДОБАВЛЯЕМ СХЕМУ ПОЛЬЗОВАТЕЛЯ
+ * Это нужно, чтобы Mongoose знал, что в коллекции 'Users' лежат имена.
+ */
+const userSchema = new mongoose.Schema({
+  username: { type: String, required: true },
+  createdAt: { type: Date, default: Date.now }
+});
+
+// Создаем модель User (аналог таблицы)
+const User = mongoose.model('User', userSchema);
+
+/**
+ * 2. ВКЛЮЧАЕМ ЧТЕНИЕ JSON
+ * Эту строку поставь ГДЕ-НИБУДЬ ВВЕРХУ (после const app = express();)
+ * Без неё сервер не поймет данные, которые прислал api.ts.
+ */
+app.use(express.json());
+
+/**
+ * 3. САМ ОБРАБОТЧИК (ЭНДПОИНТ)
+ * Сюда прилетит запрос от твоего мобильного приложения (api.ts).
+ */
+app.post('/api/test-user', async (req, res) => {
+  // Вытаскиваем имя из тела запроса
+  const { username } = req.body;
+
+  try {
+    // УДАЛЕНИЕ: Сначала стираем старого юзера с таким же именем.
+    // User — это наша модель, которую мы создали выше.
+    await User.deleteMany({ username: username });
+
+    // СОЗДАНИЕ: Делаем новую запись.
+    const newUser = new User({ username: username });
+    await newUser.save();
+
+    console.log(`[OK] Юзер ${username} создан в базе.`);
+
+    // ОТВЕТ: Говорим фронтенду, что всё получилось, и отдаем ID.
+    res.status(200).send({ 
+      message: "Успешно сохранено!", 
+      id: newUser._id 
+    });
+
+  } catch (e) {
+    // Если что-то пошло не так (например, база отключилась)
+    console.error("Ошибка при работе с базой:", e);
+    res.status(500).send({ error: "Ошибка сервера" });
+  }
+});
+
+//////////////////////////////////////////////////////
 
 // 5. Логика работы через WebSockets
 io.on('connection', async (socket) => {
