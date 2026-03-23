@@ -49,23 +49,15 @@ const cleanupInactiveUsers = async () => {
 // Запускаем cleanup каждые 20 секунд
 setInterval(cleanupInactiveUsers, 20000);
 
-// --- ИЗМЕНЕНИЕ 1: СХЕМА СООБЩЕНИЯ ---
-// Мы добавили поле chatId. Теперь каждое сообщение знает, в какой "папке" оно лежит.
+// --- СХЕМА СООБЩЕНИЯ ---
 const messageSchema = new mongoose.Schema({
-  chatId: { type: String, required: true }, // <--- НОВОЕ ПОЛЕ
-  user: { type: String, required: true },
-  text: { type: String, required: true },
+  chatId:    { type: String, required: true, index: true },
+  sender:    { type: mongoose.Schema.Types.ObjectId, ref: 'AuthUser', required: true },
+  text:      { type: String, required: true },
   timestamp: { type: Date, default: Date.now }
-});
+}, { versionKey: false });
 
 const Message = mongoose.model('Message', messageSchema);
-
-// Легкая схема для тестового эндпоинта
-const chatUserSchema = new mongoose.Schema({
-  username: { type: String, required: true },
-  createdAt: { type: Date, default: Date.now }
-});
-const ChatUser = mongoose.model('ChatUser', chatUserSchema);
 
 // Схема аккаунта для авторизации
 const authUserSchema = new mongoose.Schema({
@@ -82,8 +74,13 @@ const authUserSchema = new mongoose.Schema({
 const AuthUser = mongoose.model('AuthUser', authUserSchema);
 
 const directChatSchema = new mongoose.Schema({
-  chatId: { type: String, required: true, unique: true },
+  chatId:       { type: String, required: true, unique: true },
   participants: [{ type: mongoose.Schema.Types.ObjectId, ref: 'AuthUser', required: true }],
+  lastMessage:  {
+    text:      String,
+    sender:    { type: mongoose.Schema.Types.ObjectId, ref: 'AuthUser' },
+    timestamp: Date
+  },
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
 }, { versionKey: false });
@@ -339,6 +336,7 @@ app.get('/api/chats/direct', authMiddleware, async (req, res) => {
         return {
           chatId: chat.chatId,
           otherUser: sanitizeUser(otherUser),
+          lastMessage: chat.lastMessage || null,
           updatedAt: chat.updatedAt
         };
       })
@@ -395,15 +393,28 @@ app.post('/api/chats/direct', authMiddleware, async (req, res) => {
   }
 });
 
-app.post('/api/test-user', async (req, res) => {
-  const { username } = req.body;
+// --- История сообщений (с пагинацией по курсору) ---
+app.get('/api/chats/:chatId/messages', authMiddleware, async (req, res) => {
+  const { chatId } = req.params;
+  const before = req.query.before ? new Date(req.query.before) : new Date();
+  const limit = Math.min(parseInt(req.query.limit) || 30, 100);
+
   try {
-    await ChatUser.deleteMany({ username });
-    const newUser = new ChatUser({ username });
-    await newUser.save();
-    res.status(200).send({ message: "Успешно!", id: newUser._id });
-  } catch (e) {
-    res.status(500).send({ error: "Ошибка сервера" });
+    // Только участник чата может читать его сообщения
+    const chat = await DirectChat.findOne({ chatId, participants: req.authUser._id });
+    if (!chat) {
+      return res.status(403).json({ error: 'Нет доступа к этому чату' });
+    }
+
+    const messages = await Message.find({ chatId, timestamp: { $lt: before } })
+      .sort({ timestamp: -1 })
+      .limit(limit)
+      .populate('sender', 'username avatar');
+
+    return res.status(200).json({ messages: messages.reverse() });
+  } catch (err) {
+    console.error('❌ Ошибка загрузки сообщений:', err);
+    return res.status(500).json({ error: 'Ошибка сервера при загрузке сообщений' });
   }
 });
 
@@ -446,62 +457,78 @@ io.on('connection', async (socket) => {
     }
   });
 
-  // --- ИЗМЕНЕНИЕ 2: ЗАГРУЗКА ИСТОРИИ ПО ID ЧАТА ---
-  // Теперь при входе клиент говорит: "Дай историю для ЧАТА Х"
+  // --- ВХОД В КОМНАТУ ЧАТА ---
   socket.on('joinChat', async (chatId) => {
     try {
       const userId = socket.data.user?.id?.toString();
       recordActivity(userId);
-      
-      // Ищем в базе только те сообщения, где chatId совпадает
-      const historyData = await Message.find({ chatId: chatId })
-                                       .sort({ timestamp: 1 })
-                                       .limit(50);
-      
-      socket.emit('history', historyData);
-      console.log(`📜 Отправлена история для чата: ${chatId}`);
+
+      // Только участник чата может войти в комнату
+      const chat = await DirectChat.findOne({ chatId, participants: userId });
+      if (!chat) {
+        socket.emit('error', { message: 'Нет доступа к чату' });
+        return;
+      }
+
+      socket.join(chatId);
+      console.log(`🚪 ${socket.data.user?.username} вошёл в чат: ${chatId}`);
     } catch (err) {
-      console.error('❌ Ошибка загрузки истории:', err);
+      console.error('❌ Ошибка joinChat:', err);
     }
   });
 
-  // --- ИЗМЕНЕНИЕ 3: СОХРАНЕНИЕ С УЧЕТОМ ID ЧАТА ---
+  // --- ОТПРАВКА СООБЩЕНИЯ ---
   socket.on('message', async (data) => {
     try {
       const userId = socket.data.user?.id?.toString();
       recordActivity(userId);
 
-      // Убеждаемся, что пользователь помечен как online
       if (userId) {
         await ensureUserOnlineStatus(userId, true);
       }
 
-      // Ожидаем, что фронтенд пришлет { text, senderName, chatId }
+      // Ожидаем { text: string, chatId: string }
       if (!data.text || !data.chatId) return;
 
-      const username = socket.data.user?.username;
-      if (!username) return;
+      // Только участник может отправлять сообщения в чат
+      const chat = await DirectChat.findOne({ chatId: data.chatId, participants: userId });
+      if (!chat) return;
 
+      const newMessage = await Message.create({
+        chatId:  data.chatId,
+        sender:  userId,
+        text:    data.text.trim()
+      });
+
+      // Обновляем мета-данные чата
       await DirectChat.updateOne(
         { chatId: data.chatId },
-        { $set: { updatedAt: new Date() } }
+        {
+          $set: {
+            updatedAt:   newMessage.timestamp,
+            lastMessage: {
+              text:      newMessage.text,
+              sender:    userId,
+              timestamp: newMessage.timestamp
+            }
+          }
+        }
       );
 
-      const newMessage = new Message({
-        chatId: data.chatId, // <--- Сохраняем привязку к чату
-        user: username,
-        text: data.text
-      });
-
-      await newMessage.save();
-      
-      // Рассылаем всем. Фронтенд сам отфильтрует, в какой чат это вывести
-      io.emit('message', {
-        ...data,
-        senderName: username,
-        id: newMessage._id,
+      const payload = {
+        id:        newMessage._id,
+        chatId:    data.chatId,
+        sender: {
+          id:       socket.data.user.id,
+          username: socket.data.user.username,
+          avatar:   socket.data.user.avatar
+        },
+        text:      newMessage.text,
         timestamp: newMessage.timestamp
-      });
+      };
+
+      // Рассылаем ТОЛЬКО участникам этого чата
+      io.to(data.chatId).emit('message', payload);
 
     } catch (err) {
       console.error('❌ Ошибка сообщения:', err);
