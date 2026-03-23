@@ -5,11 +5,13 @@ const { Server } = require('socket.io');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
+const cors = require('cors');
 
 const app = express();
 const server = http.createServer(app);
 const activeTokens = new Map();
 
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'] }));
 app.use(express.json());
 
 const io = new Server(server, {
