@@ -24,6 +24,31 @@ mongoose.connect(mongoURI)
   .then(() => console.log('✅ Успешно подключено к MongoDB!'))
   .catch(err => console.error('❌ Ошибка подключения к базе:', err));
 
+// --- PRESENCE TRACKING ---
+const userLastActivity = new Map(); // userId -> lastActivityTime
+const INACTIVITY_TIMEOUT = 35000; // 35 seconds
+
+const recordActivity = (userId) => {
+  if (userId) {
+    userLastActivity.set(userId.toString(), Date.now());
+  }
+};
+
+const cleanupInactiveUsers = async () => {
+  const now = Date.now();
+  for (const [userId, lastActivity] of userLastActivity.entries()) {
+    if (now - lastActivity > INACTIVITY_TIMEOUT) {
+      userLastActivity.delete(userId);
+      onlineConnections.delete(userId);
+      await ensureUserOnlineStatus(userId, false);
+      console.log(`⏱️  Пользователь ${userId} неактивен, статус: offline`);
+    }
+  }
+};
+
+// Запускаем cleanup каждые 20 секунд
+setInterval(cleanupInactiveUsers, 20000);
+
 // --- ИЗМЕНЕНИЕ 1: СХЕМА СООБЩЕНИЯ ---
 // Мы добавили поле chatId. Теперь каждое сообщение знает, в какой "папке" оно лежит.
 const messageSchema = new mongoose.Schema({
@@ -363,6 +388,7 @@ io.on('connection', async (socket) => {
 
   const userId = socket.data.user?.id?.toString();
   if (userId) {
+    recordActivity(userId);
     const count = onlineConnections.get(userId) || 0;
     onlineConnections.set(userId, count + 1);
     if (count === 0) {
@@ -370,10 +396,21 @@ io.on('connection', async (socket) => {
     }
   }
 
+  // --- HEARTBEAT: Клиент периодически пингует для обновления активности ---
+  socket.on('ping', () => {
+    const userId = socket.data.user?.id?.toString();
+    if (userId) {
+      recordActivity(userId);
+    }
+  });
+
   // --- ИЗМЕНЕНИЕ 2: ЗАГРУЗКА ИСТОРИИ ПО ID ЧАТА ---
   // Теперь при входе клиент говорит: "Дай историю для ЧАТА Х"
   socket.on('joinChat', async (chatId) => {
     try {
+      const userId = socket.data.user?.id?.toString();
+      recordActivity(userId);
+      
       // Ищем в базе только те сообщения, где chatId совпадает
       const historyData = await Message.find({ chatId: chatId })
                                        .sort({ timestamp: 1 })
@@ -389,6 +426,9 @@ io.on('connection', async (socket) => {
   // --- ИЗМЕНЕНИЕ 3: СОХРАНЕНИЕ С УЧЕТОМ ID ЧАТА ---
   socket.on('message', async (data) => {
     try {
+      const userId = socket.data.user?.id?.toString();
+      recordActivity(userId);
+
       // Ожидаем, что фронтенд пришлет { text, senderName, chatId }
       if (!data.text || !data.chatId) return;
 
@@ -432,6 +472,7 @@ io.on('connection', async (socket) => {
     const count = onlineConnections.get(disconnectedUserId) || 0;
     if (count <= 1) {
       onlineConnections.delete(disconnectedUserId);
+      userLastActivity.delete(disconnectedUserId);
       await ensureUserOnlineStatus(disconnectedUserId, false);
       return;
     }
