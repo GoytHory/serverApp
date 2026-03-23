@@ -61,6 +61,22 @@ const sanitizeUser = (userDoc) => ({
   createdAt: userDoc.createdAt
 });
 
+const getUserByToken = async (token) => {
+  if (!token || !activeTokens.has(token)) {
+    return null;
+  }
+
+  const userId = activeTokens.get(token);
+  const user = await AuthUser.findById(userId);
+
+  if (!user) {
+    activeTokens.delete(token);
+    return null;
+  }
+
+  return user;
+};
+
 app.post('/api/auth/register', async (req, res) => {
   const username = (req.body?.username || '').trim();
   const password = req.body?.password || '';
@@ -139,15 +155,9 @@ app.get('/api/auth/me', async (req, res) => {
     const authHeader = req.headers.authorization || '';
     const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
 
-    if (!token || !activeTokens.has(token)) {
-      return res.status(401).json({ error: 'Требуется авторизация' });
-    }
-
-    const userId = activeTokens.get(token);
-    const user = await AuthUser.findById(userId);
+    const user = await getUserByToken(token);
     if (!user) {
-      activeTokens.delete(token);
-      return res.status(401).json({ error: 'Пользователь не найден' });
+      return res.status(401).json({ error: 'Требуется авторизация' });
     }
 
     return res.status(200).json({ user: sanitizeUser(user) });
@@ -169,9 +179,26 @@ app.post('/api/test-user', async (req, res) => {
   }
 });
 
+io.use(async (socket, next) => {
+  try {
+    const token = socket.handshake.auth?.token;
+    const user = await getUserByToken(token);
+
+    if (!user) {
+      return next(new Error('Требуется авторизация'));
+    }
+
+    socket.data.user = sanitizeUser(user);
+    return next();
+  } catch (err) {
+    console.error('❌ Ошибка socket auth:', err);
+    return next(new Error('Ошибка авторизации сокета'));
+  }
+});
+
 // --- ЛОГИКА РАБОТЫ (SOCKET.IO) ---
 io.on('connection', async (socket) => {
-  console.log('📱 Подключен:', socket.id);
+  console.log('📱 Подключен:', socket.id, socket.data.user?.username);
 
   // --- ИЗМЕНЕНИЕ 2: ЗАГРУЗКА ИСТОРИИ ПО ID ЧАТА ---
   // Теперь при входе клиент говорит: "Дай историю для ЧАТА Х"
@@ -195,9 +222,12 @@ io.on('connection', async (socket) => {
       // Ожидаем, что фронтенд пришлет { text, senderName, chatId }
       if (!data.text || !data.chatId) return;
 
+      const username = socket.data.user?.username;
+      if (!username) return;
+
       const newMessage = new Message({
         chatId: data.chatId, // <--- Сохраняем привязку к чату
-        user: data.senderName || data.user || 'Аноним',
+        user: username,
         text: data.text
       });
 
@@ -206,6 +236,7 @@ io.on('connection', async (socket) => {
       // Рассылаем всем. Фронтенд сам отфильтрует, в какой чат это вывести
       io.emit('message', {
         ...data,
+        senderName: username,
         id: newMessage._id,
         timestamp: newMessage.timestamp
       });
