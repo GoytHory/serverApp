@@ -153,6 +153,8 @@ const ensureUserOnlineStatus = async (userId, isOnline) => {
 };
 
 app.post('/api/auth/register', async (req, res) => {
+  console.log('🔄 [REGISTER] Начало обработки регистрации');
+  const startTime = Date.now();
   const username = (req.body?.username || '').trim();
   const password = req.body?.password || '';
 
@@ -165,32 +167,44 @@ app.post('/api/auth/register', async (req, res) => {
   }
 
   try {
+    console.log(`⏱️  [REGISTER] Ищу пользователя "${username}" в БД...`);
     const existingUser = await AuthUser.findOne({ username });
     if (existingUser) {
+      console.log(`⏱️  [REGISTER] Пользователь уже существует (${Date.now() - startTime}ms)`);
       return res.status(409).json({ error: 'Пользователь с таким именем уже существует' });
     }
 
+    console.log(`⏱️  [REGISTER] Хэширую пароль...`);
     const hashedPassword = await bcrypt.hash(password, 10);
+    
+    console.log(`⏱️  [REGISTER] Создаю пользователя в БД...`);
     const createdUser = await AuthUser.create({
       username,
       password: hashedPassword,
       status: 'online'
     });
 
+    console.log(`⏱️  [REGISTER] Генерирую токен...`);
     const token = crypto.randomBytes(24).toString('hex');
     activeTokens.set(token, createdUser._id.toString());
+
+    const totalTime = Date.now() - startTime;
+    console.log(`✅ [REGISTER] Готово за ${totalTime}ms`);
 
     return res.status(201).json({
       token,
       user: sanitizeUser(createdUser)
     });
   } catch (err) {
-    console.error('❌ Ошибка регистрации:', err);
+    const totalTime = Date.now() - startTime;
+    console.error(`❌ [REGISTER] Ошибка за ${totalTime}ms:`, err.message);
     return res.status(500).json({ error: 'Ошибка сервера при регистрации' });
   }
 });
 
 app.post('/api/auth/login', async (req, res) => {
+  console.log('🔄 [LOGIN] Начало обработки входа');
+  const startTime = Date.now();
   const username = (req.body?.username || '').trim();
   const password = req.body?.password || '';
 
@@ -199,44 +213,64 @@ app.post('/api/auth/login', async (req, res) => {
   }
 
   try {
+    console.log(`⏱️  [LOGIN] Ищу пользователя "${username}" в БД...`);
     const user = await AuthUser.findOne({ username });
     if (!user) {
+      const time = Date.now() - startTime;
+      console.log(`❌ [LOGIN] Пользователь не найден (${time}ms)`);
       return res.status(401).json({ error: 'Неверное имя пользователя или пароль' });
     }
 
+    console.log(`⏱️  [LOGIN] Проверяю пароль...`);
     const isValidPassword = await bcrypt.compare(password, user.password);
     if (!isValidPassword) {
+      const time = Date.now() - startTime;
+      console.log(`❌ [LOGIN] Неверный пароль (${time}ms)`);
       return res.status(401).json({ error: 'Неверное имя пользователя или пароль' });
     }
 
+    console.log(`⏱️  [LOGIN] Обновляю статус на online...`);
     user.status = 'online';
     await user.save();
 
+    console.log(`⏱️  [LOGIN] Генерирую токен...`);
     const token = crypto.randomBytes(24).toString('hex');
     activeTokens.set(token, user._id.toString());
+
+    const totalTime = Date.now() - startTime;
+    console.log(`✅ [LOGIN] Готово за ${totalTime}ms`);
 
     return res.status(200).json({
       token,
       user: sanitizeUser(user)
     });
   } catch (err) {
-    console.error('❌ Ошибка входа:', err);
+    const totalTime = Date.now() - startTime;
+    console.error(`❌ [LOGIN] Ошибка за ${totalTime}ms:`, err.message);
     return res.status(500).json({ error: 'Ошибка сервера при входе' });
   }
 });
 
 app.get('/api/auth/me', async (req, res) => {
+  console.log('🔄 [ME] Запрос профиля');
+  const startTime = Date.now();
   try {
     const token = getTokenFromAuthHeader(req.headers.authorization || '');
 
     const user = await getUserByToken(token);
     if (!user) {
+      const time = Date.now() - startTime;
+      console.log(`❌ [ME] Требуется авторизация (${time}ms)`);
       return res.status(401).json({ error: 'Требуется авторизация' });
     }
 
+    const totalTime = Date.now() - startTime;
+    console.log(`✅ [ME] Готово за ${totalTime}ms`);
+    
     return res.status(200).json({ user: sanitizeUser(user) });
   } catch (err) {
-    console.error('❌ Ошибка auth/me:', err);
+    const totalTime = Date.now() - startTime;
+    console.error(`❌ [ME] Ошибка за ${totalTime}ms:`, err.message);
     return res.status(500).json({ error: 'Ошибка сервера' });
   }
 });
@@ -282,10 +316,14 @@ app.get('/api/users/search', authMiddleware, async (req, res) => {
 });
 
 app.get('/api/chats/direct', authMiddleware, async (req, res) => {
+  console.log('🔄 [CHATS] Запрос списка персональных чатов');
+  const startTime = Date.now();
   try {
     const myUserId = req.authUser._id;
+    console.log(`⏱️  [CHATS] Ищу чаты для пользователя ${myUserId}...`);
     const chats = await DirectChat.find({ participants: myUserId }).sort({ updatedAt: -1 });
-
+    
+    console.log(`⏱️  [CHATS] Загружаю данные пользователей для ${chats.length} чатов...`);
     const preview = await Promise.all(
       chats.map(async (chat) => {
         const otherUserId = chat.participants.find((id) => id.toString() !== myUserId.toString());
@@ -306,9 +344,13 @@ app.get('/api/chats/direct', authMiddleware, async (req, res) => {
       })
     );
 
+    const totalTime = Date.now() - startTime;
+    console.log(`✅ [CHATS] Готово за ${totalTime}ms (найдено ${preview.filter(Boolean).length} чатов)`);
+    
     return res.status(200).json({ chats: preview.filter(Boolean) });
   } catch (err) {
-    console.error('❌ Ошибка списка персональных чатов:', err);
+    const totalTime = Date.now() - startTime;
+    console.error(`❌ [CHATS] Ошибка за ${totalTime}ms:`, err.message);
     return res.status(500).json({ error: 'Ошибка сервера при загрузке чатов' });
   }
 });
