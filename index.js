@@ -429,6 +429,11 @@ io.on('connection', async (socket) => {
       const userId = socket.data.user?.id?.toString();
       recordActivity(userId);
 
+      // Убеждаемся, что пользователь помечен как online
+      if (userId) {
+        await ensureUserOnlineStatus(userId, true);
+      }
+
       // Ожидаем, что фронтенд пришлет { text, senderName, chatId }
       if (!data.text || !data.chatId) return;
 
