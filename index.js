@@ -13,7 +13,7 @@ const activeTokens = new Map();
 const onlineConnections = new Map();
 
 app.use(cors({ origin: "*", methods: ["GET", "POST", "PATCH", "OPTIONS"] }));
-app.use(express.json());
+app.use(express.json({ limit: "20mb" }));
 
 const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST", "PATCH"] },
@@ -178,7 +178,26 @@ const ensureUserOnlineStatus = async (userId, isOnline) => {
   }
 };
 
-const MAX_IMAGE_BASE64_LENGTH = 8 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 12 * 1024 * 1024;
+
+const getBase64Content = (value) => {
+  const normalized = (value || "").toString().trim();
+  const commaIndex = normalized.indexOf(",");
+
+  if (normalized.startsWith("data:") && commaIndex >= 0) {
+    return normalized.slice(commaIndex + 1);
+  }
+
+  return normalized;
+};
+
+const getBase64ByteSize = (base64Value) => {
+  try {
+    return Buffer.byteLength(base64Value, "base64");
+  } catch {
+    return 0;
+  }
+};
 
 const buildMessagePreviewText = (text, mediaType) => {
   const normalized = (text || "").trim();
@@ -389,7 +408,7 @@ app.patch("/api/users/me", authMiddleware, async (req, res) => {
 });
 
 app.post("/api/media/image", authMiddleware, async (req, res) => {
-  const base64 = (req.body?.base64 || "").toString().trim();
+  const base64 = getBase64Content(req.body?.base64);
   const mimeType = (req.body?.mimeType || "").toString().trim().toLowerCase();
   const context = (req.body?.context || "chat").toString().trim();
 
@@ -397,8 +416,15 @@ app.post("/api/media/image", authMiddleware, async (req, res) => {
     return res.status(400).json({ error: "Нужно передать base64" });
   }
 
-  if (base64.length > MAX_IMAGE_BASE64_LENGTH) {
-    return res.status(400).json({ error: "Изображение слишком большое" });
+  const imageBytes = getBase64ByteSize(base64);
+  if (!imageBytes) {
+    return res.status(400).json({ error: "Некорректный base64" });
+  }
+
+  if (imageBytes > MAX_IMAGE_BYTES) {
+    return res
+      .status(400)
+      .json({ error: "Изображение слишком большое. Максимум 12MB" });
   }
 
   const allowedMimeTypes = [
