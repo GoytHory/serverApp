@@ -1,4 +1,3 @@
-const express = require('express');
 require("dotenv").config({ path: require("path").join(__dirname, "file.env") });
 const express = require("express");
 const http = require("http");
