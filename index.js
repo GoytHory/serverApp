@@ -1227,7 +1227,9 @@ io.on("connection", async (socket) => {
           .filter((userDoc) => {
             const userId = userDoc._id.toString();
             const hasOpenConnections = (onlineConnections.get(userId) || 0) > 0;
-            return !hasOpenConnections && isExpoPushToken(userDoc.expoPushToken);
+            return (
+              !hasOpenConnections && isExpoPushToken(userDoc.expoPushToken)
+            );
           })
           .map((userDoc) => ({
             to: userDoc.expoPushToken,
