@@ -6,6 +6,8 @@ const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
 const cors = require("cors");
+const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
+const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
 const app = express();
 const server = http.createServer(app);
@@ -13,30 +15,134 @@ const activeTokens = new Map();
 const onlineConnections = new Map();
 
 app.use(cors({ origin: "*", methods: ["GET", "POST", "PATCH", "OPTIONS"] }));
-app.get("/health", (req, res) => {
+app.get("/health", (_req, res) => {
   res.status(200).json({ ok: true, uptime: process.uptime(), ts: Date.now() });
 });
-app.use(express.json({ limit: "20mb" }));
+app.use(express.json({ limit: "25mb" }));
 
 const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST", "PATCH"] },
 });
 
-const IMGBB_API_KEY = (process.env.IMGBB_API_KEY || "").trim();
+const DEFAULT_AVATAR_URL = "https://cdn-icons-png.flaticon.com/512/149/149071.png";
+
+const B2_KEY_ID = (process.env.B2_KEY_ID || "").trim();
+const B2_APPLICATION_KEY = (process.env.B2_APPLICATION_KEY || "").trim();
+const B2_BUCKET_NAME = (process.env.B2_BUCKET_NAME || "").trim();
+const B2_ENDPOINT = (process.env.B2_ENDPOINT || "").trim();
+const B2_REGION = (process.env.B2_REGION || "").trim();
+
+const parsePositiveInt = (value, fallback) => {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const CHAT_MEDIA_URL_TTL_SEC = parsePositiveInt(
+  process.env.B2_SIGNED_URL_TTL_SEC,
+  6 * 60 * 60,
+);
+const AVATAR_URL_TTL_SEC = 60 * 60;
+
+const requiredB2Vars = {
+  B2_KEY_ID,
+  B2_APPLICATION_KEY,
+  B2_BUCKET_NAME,
+  B2_ENDPOINT,
+  B2_REGION,
+};
+const missingB2Vars = Object.entries(requiredB2Vars)
+  .filter(([, value]) => !value)
+  .map(([name]) => name);
+if (missingB2Vars.length > 0) {
+  throw new Error(`Не хватает env переменных B2: ${missingB2Vars.join(", ")}`);
+}
+
+const b2Client = new S3Client({
+  region: B2_REGION,
+  endpoint: B2_ENDPOINT,
+  forcePathStyle: true,
+  credentials: {
+    accessKeyId: B2_KEY_ID,
+    secretAccessKey: B2_APPLICATION_KEY,
+  },
+});
 
 const mongoURI = process.env.MONGODB_URI;
+if (!mongoURI) {
+  throw new Error("Не настроен MONGODB_URI");
+}
+
 mongoose
   .connect(mongoURI)
   .then(() => console.log("✅ Успешно подключено к MongoDB!"))
   .catch((err) => console.error("❌ Ошибка подключения к базе:", err));
 
+const getSignedObjectUrl = async (objectKey, expiresInSec) => {
+  if (!objectKey) {
+    return null;
+  }
+
+  const command = new GetObjectCommand({
+    Bucket: B2_BUCKET_NAME,
+    Key: objectKey,
+  });
+
+  return getSignedUrl(b2Client, command, { expiresIn: expiresInSec });
+};
+
+const getFileExtensionByMimeType = (mimeType, fallbackExt) => {
+  const map = {
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "audio/aac": "aac",
+    "audio/mpeg": "mp3",
+    "audio/mp3": "mp3",
+    "audio/mp4": "m4a",
+    "audio/x-m4a": "m4a",
+    "audio/webm": "webm",
+    "audio/ogg": "ogg",
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
+  };
+
+  return map[mimeType] || fallbackExt;
+};
+
+const putBase64ObjectToB2 = async ({ base64, objectKey, mimeType }) => {
+  const bodyBuffer = Buffer.from(base64, "base64");
+
+  await b2Client.send(
+    new PutObjectCommand({
+      Bucket: B2_BUCKET_NAME,
+      Key: objectKey,
+      Body: bodyBuffer,
+      ContentType: mimeType || "application/octet-stream",
+      ServerSideEncryption: "AES256",
+    }),
+  );
+};
+
 // --- PRESENCE TRACKING ---
-const userLastActivity = new Map(); // userId -> lastActivityTime
-const INACTIVITY_TIMEOUT = 35000; // 35 seconds
+const userLastActivity = new Map();
+const INACTIVITY_TIMEOUT = 35000;
 
 const recordActivity = (userId) => {
   if (userId) {
     userLastActivity.set(userId.toString(), Date.now());
+  }
+};
+
+const buildUserRoomId = (userId) => `user:${userId.toString()}`;
+
+const ensureUserOnlineStatus = async (userId, isOnline) => {
+  try {
+    await AuthUser.findByIdAndUpdate(userId, {
+      status: isOnline ? "online" : "offline",
+    });
+  } catch (err) {
+    console.error("❌ Ошибка обновления статуса:", err);
   }
 };
 
@@ -52,10 +158,9 @@ const cleanupInactiveUsers = async () => {
   }
 };
 
-// Запускаем cleanup каждые 20 секунд
 setInterval(cleanupInactiveUsers, 20000);
 
-// --- СХЕМА СООБЩЕНИЯ ---
+// --- Mongo схемы ---
 const messageSchema = new mongoose.Schema(
   {
     chatId: { type: String, required: true, index: true },
@@ -70,6 +175,7 @@ const messageSchema = new mongoose.Schema(
         type: String,
         enum: ["image", "audio"],
       },
+      objectKey: String,
       url: String,
       mimeType: String,
       durationSec: Number,
@@ -80,18 +186,15 @@ const messageSchema = new mongoose.Schema(
 );
 
 messageSchema.index({ chatId: 1, timestamp: -1 });
-
 const Message = mongoose.model("Message", messageSchema);
 
-// Схема аккаунта для авторизации
 const authUserSchema = new mongoose.Schema(
   {
     username: { type: String, required: true, unique: true, trim: true },
     password: { type: String, required: true },
-    avatar: {
-      type: String,
-      default: "https://cdn-icons-png.flaticon.com/512/149/149071.png",
-    },
+    avatarObjectKey: { type: String, default: "" },
+    // legacy fallback for already stored public URLs
+    avatar: { type: String, default: "" },
     status: { type: String, enum: ["online", "offline"], default: "offline" },
     createdAt: { type: Date, default: Date.now },
   },
@@ -114,7 +217,8 @@ const directChatSchema = new mongoose.Schema(
           required: true,
         },
         username: { type: String, required: true },
-        avatar: { type: String, required: true },
+        avatarObjectKey: { type: String, default: "" },
+        avatar: { type: String, default: "" },
         updatedAt: { type: Date, default: Date.now },
       },
     ],
@@ -132,38 +236,59 @@ const directChatSchema = new mongoose.Schema(
 );
 
 directChatSchema.index({ "participantsMeta.userId": 1 });
-
 const DirectChat = mongoose.model("DirectChat", directChatSchema);
-
-const sanitizeUser = (userDoc) => ({
-  id: userDoc._id,
-  username: userDoc.username,
-  avatar: userDoc.avatar,
-  status: userDoc.status,
-  createdAt: userDoc.createdAt,
-});
 
 const getOnlineStatusForUser = (userId) => {
   const onlineCount = onlineConnections.get(userId.toString()) || 0;
   return onlineCount > 0 ? "online" : "offline";
 };
 
+const getAvatarUrlForUser = async (userLike) => {
+  if (userLike?.avatarObjectKey) {
+    try {
+      const signed = await getSignedObjectUrl(userLike.avatarObjectKey, AVATAR_URL_TTL_SEC);
+      if (signed) {
+        return signed;
+      }
+    } catch (err) {
+      console.error("❌ Ошибка генерации signed URL для аватара:", err.message);
+    }
+  }
+
+  if (userLike?.avatar) {
+    return userLike.avatar;
+  }
+
+  return DEFAULT_AVATAR_URL;
+};
+
+const sanitizeUser = async (userDoc) => ({
+  id: userDoc._id,
+  username: userDoc.username,
+  avatar: await getAvatarUrlForUser(userDoc),
+  status: userDoc.status,
+  createdAt: userDoc.createdAt,
+});
+
 const toParticipantSnapshot = (userDoc) => ({
   userId: userDoc._id,
   username: userDoc.username,
-  avatar: userDoc.avatar,
+  avatarObjectKey: userDoc.avatarObjectKey || "",
+  avatar: userDoc.avatar || "",
   updatedAt: new Date(),
 });
 
-const snapshotToClientUser = (snapshot) => {
+const snapshotToClientUser = async (snapshot) => {
   if (!snapshot?.userId) {
     return null;
   }
 
+  const avatar = await getAvatarUrlForUser(snapshot);
+
   return {
     id: snapshot.userId,
     username: snapshot.username,
-    avatar: snapshot.avatar,
+    avatar,
     status: getOnlineStatusForUser(snapshot.userId),
   };
 };
@@ -175,9 +300,7 @@ const hasCompleteParticipantsMeta = (chatDoc) => {
 
   return (
     participantsMeta.length === chatDoc.participants.length &&
-    participantsMeta.every(
-      (entry) => entry?.userId && entry?.username && entry?.avatar,
-    )
+    participantsMeta.every((entry) => entry?.userId && entry?.username)
   );
 };
 
@@ -234,19 +357,8 @@ const buildDirectChatId = (firstUserId, secondUserId) => {
   return `dm:${sortedIds[0]}:${sortedIds[1]}`;
 };
 
-const buildUserRoomId = (userId) => `user:${userId.toString()}`;
-
-const ensureUserOnlineStatus = async (userId, isOnline) => {
-  try {
-    await AuthUser.findByIdAndUpdate(userId, {
-      status: isOnline ? "online" : "offline",
-    });
-  } catch (err) {
-    console.error("❌ Ошибка обновления статуса:", err);
-  }
-};
-
 const MAX_IMAGE_BYTES = 12 * 1024 * 1024;
+const MAX_AUDIO_BYTES = 18 * 1024 * 1024;
 
 const getBase64Content = (value) => {
   const normalized = (value || "").toString().trim();
@@ -284,37 +396,56 @@ const buildMessagePreviewText = (text, mediaType) => {
   return "Сообщение";
 };
 
-const uploadBase64ToImgBb = async (base64, name) => {
-  if (!IMGBB_API_KEY) {
-    throw new Error("IMGBB API key не настроен");
+const resolveMessageMediaForClient = async (media) => {
+  if (!media?.type) {
+    return undefined;
   }
 
-  const payload = new URLSearchParams();
-  payload.set("image", base64);
-  if (name) {
-    payload.set("name", name);
-  }
-
-  const response = await fetch(
-    `https://api.imgbb.com/1/upload?key=${encodeURIComponent(IMGBB_API_KEY)}`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body: payload.toString(),
-    },
-  );
-
-  const data = await response.json();
-  if (!response.ok || !data?.success || !data?.data?.url) {
-    throw new Error(data?.error?.message || "Ошибка загрузки файла в ImgBB");
+  let signedUrl = null;
+  if (media.objectKey) {
+    try {
+      signedUrl = await getSignedObjectUrl(media.objectKey, CHAT_MEDIA_URL_TTL_SEC);
+    } catch (err) {
+      console.error("❌ Ошибка генерации signed URL для сообщения:", err.message);
+    }
   }
 
   return {
-    url: data.data.url,
-    displayUrl: data.data.display_url,
-    deleteUrl: data.data.delete_url,
+    type: media.type,
+    objectKey: media.objectKey,
+    url: signedUrl || media.url || "",
+    mimeType: media.mimeType,
+    durationSec: media.durationSec,
+  };
+};
+
+const serializeMessageForClient = async (messageDoc) => {
+  let sender = messageDoc.sender;
+
+  if (sender && typeof sender === "object" && !sender.username && sender._id) {
+    const fullSender = await AuthUser.findById(sender._id);
+    if (fullSender) {
+      sender = fullSender;
+    }
+  }
+
+  let senderPayload = undefined;
+  if (sender && typeof sender === "object") {
+    senderPayload = {
+      id: sender._id || sender.id,
+      username: sender.username,
+      avatar: await getAvatarUrlForUser(sender),
+    };
+  }
+
+  return {
+    id: messageDoc._id,
+    _id: messageDoc._id,
+    chatId: messageDoc.chatId,
+    text: messageDoc.text || "",
+    media: await resolveMessageMediaForClient(messageDoc.media),
+    timestamp: messageDoc.timestamp,
+    sender: senderPayload,
   };
 };
 
@@ -337,28 +468,23 @@ app.post("/api/auth/register", async (req, res) => {
   }
 
   try {
-    console.log(`⏱️  [REGISTER] Ищу пользователя "${username}" в БД...`);
     const existingUser = await AuthUser.findOne({ username });
     if (existingUser) {
-      console.log(
-        `⏱️  [REGISTER] Пользователь уже существует (${Date.now() - startTime}ms)`,
-      );
       return res
         .status(409)
         .json({ error: "Пользователь с таким именем уже существует" });
     }
 
-    console.log(`⏱️  [REGISTER] Хэширую пароль...`);
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    console.log(`⏱️  [REGISTER] Создаю пользователя в БД...`);
     const createdUser = await AuthUser.create({
       username,
       password: hashedPassword,
       status: "online",
+      avatarObjectKey: "",
+      avatar: "",
     });
 
-    console.log(`⏱️  [REGISTER] Генерирую токен...`);
     const token = crypto.randomBytes(24).toString("hex");
     activeTokens.set(token, createdUser._id.toString());
 
@@ -367,7 +493,7 @@ app.post("/api/auth/register", async (req, res) => {
 
     return res.status(201).json({
       token,
-      user: sanitizeUser(createdUser),
+      user: await sanitizeUser(createdUser),
     });
   } catch (err) {
     const totalTime = Date.now() - startTime;
@@ -389,31 +515,23 @@ app.post("/api/auth/login", async (req, res) => {
   }
 
   try {
-    console.log(`⏱️  [LOGIN] Ищу пользователя "${username}" в БД...`);
     const user = await AuthUser.findOne({ username });
     if (!user) {
-      const time = Date.now() - startTime;
-      console.log(`❌ [LOGIN] Пользователь не найден (${time}ms)`);
       return res
         .status(401)
         .json({ error: "Неверное имя пользователя или пароль" });
     }
 
-    console.log(`⏱️  [LOGIN] Проверяю пароль...`);
     const isValidPassword = await bcrypt.compare(password, user.password);
     if (!isValidPassword) {
-      const time = Date.now() - startTime;
-      console.log(`❌ [LOGIN] Неверный пароль (${time}ms)`);
       return res
         .status(401)
         .json({ error: "Неверное имя пользователя или пароль" });
     }
 
-    console.log(`⏱️  [LOGIN] Обновляю статус на online...`);
     user.status = "online";
     await user.save();
 
-    console.log(`⏱️  [LOGIN] Генерирую токен...`);
     const token = crypto.randomBytes(24).toString("hex");
     activeTokens.set(token, user._id.toString());
 
@@ -422,7 +540,7 @@ app.post("/api/auth/login", async (req, res) => {
 
     return res.status(200).json({
       token,
-      user: sanitizeUser(user),
+      user: await sanitizeUser(user),
     });
   } catch (err) {
     const totalTime = Date.now() - startTime;
@@ -432,38 +550,31 @@ app.post("/api/auth/login", async (req, res) => {
 });
 
 app.get("/api/auth/me", async (req, res) => {
-  console.log("🔄 [ME] Запрос профиля");
-  const startTime = Date.now();
   try {
     const token = getTokenFromAuthHeader(req.headers.authorization || "");
-
     const user = await getUserByToken(token);
+
     if (!user) {
-      const time = Date.now() - startTime;
-      console.log(`❌ [ME] Требуется авторизация (${time}ms)`);
       return res.status(401).json({ error: "Требуется авторизация" });
     }
 
-    const totalTime = Date.now() - startTime;
-    console.log(`✅ [ME] Готово за ${totalTime}ms`);
-
-    return res.status(200).json({ user: sanitizeUser(user) });
+    return res.status(200).json({ user: await sanitizeUser(user) });
   } catch (err) {
-    const totalTime = Date.now() - startTime;
-    console.error(`❌ [ME] Ошибка за ${totalTime}ms:`, err.message);
+    console.error("❌ Ошибка /api/auth/me:", err.message);
     return res.status(500).json({ error: "Ошибка сервера" });
   }
 });
 
 app.patch("/api/users/me", authMiddleware, async (req, res) => {
-  const avatar = (req.body?.avatar || "").trim();
+  const avatarObjectKey = (req.body?.avatarObjectKey || "").toString().trim();
 
-  if (!avatar) {
-    return res.status(400).json({ error: "Нужно передать avatar" });
+  if (!avatarObjectKey) {
+    return res.status(400).json({ error: "Нужно передать avatarObjectKey" });
   }
 
   try {
-    req.authUser.avatar = avatar;
+    req.authUser.avatarObjectKey = avatarObjectKey;
+    req.authUser.avatar = "";
     await req.authUser.save();
 
     await DirectChat.updateMany(
@@ -471,7 +582,8 @@ app.patch("/api/users/me", authMiddleware, async (req, res) => {
       {
         $set: {
           "participantsMeta.$[participant].username": req.authUser.username,
-          "participantsMeta.$[participant].avatar": req.authUser.avatar,
+          "participantsMeta.$[participant].avatarObjectKey": req.authUser.avatarObjectKey,
+          "participantsMeta.$[participant].avatar": "",
           "participantsMeta.$[participant].updatedAt": new Date(),
         },
       },
@@ -480,7 +592,7 @@ app.patch("/api/users/me", authMiddleware, async (req, res) => {
       },
     );
 
-    return res.status(200).json({ user: sanitizeUser(req.authUser) });
+    return res.status(200).json({ user: await sanitizeUser(req.authUser) });
   } catch (err) {
     console.error("❌ Ошибка обновления профиля:", err);
     return res
@@ -492,7 +604,7 @@ app.patch("/api/users/me", authMiddleware, async (req, res) => {
 app.post("/api/media/image", authMiddleware, async (req, res) => {
   const base64 = getBase64Content(req.body?.base64);
   const mimeType = (req.body?.mimeType || "").toString().trim().toLowerCase();
-  const context = (req.body?.context || "chat").toString().trim();
+  const context = (req.body?.context || "chat").toString().trim().toLowerCase();
 
   if (!base64) {
     return res.status(400).json({ error: "Нужно передать base64" });
@@ -522,17 +634,91 @@ app.post("/api/media/image", authMiddleware, async (req, res) => {
   }
 
   try {
-    const uploaded = await uploadBase64ToImgBb(
+    const extension = getFileExtensionByMimeType(mimeType || "image/jpeg", "jpg");
+    const folder = context === "avatar" ? "avatars" : "chat/images";
+    const objectKey = `${folder}/${req.authUser._id}/${Date.now()}_${crypto.randomBytes(5).toString("hex")}.${extension}`;
+
+    await putBase64ObjectToB2({
       base64,
-      `${context}_${Date.now()}`,
-    );
+      objectKey,
+      mimeType: mimeType || "image/jpeg",
+    });
+
+    const ttl = context === "avatar" ? AVATAR_URL_TTL_SEC : CHAT_MEDIA_URL_TTL_SEC;
+    const url = await getSignedObjectUrl(objectKey, ttl);
+
     return res.status(200).json({
-      url: uploaded.url,
-      displayUrl: uploaded.displayUrl,
+      objectKey,
+      url,
+      mediaType: "image",
     });
   } catch (err) {
     console.error("❌ Ошибка загрузки изображения:", err.message);
     return res.status(500).json({ error: "Не удалось загрузить изображение" });
+  }
+});
+
+app.post("/api/media/audio", authMiddleware, async (req, res) => {
+  const base64 = getBase64Content(req.body?.base64);
+  const mimeType = (req.body?.mimeType || "").toString().trim().toLowerCase();
+  const durationSecRaw = req.body?.durationSec;
+  const durationSec =
+    typeof durationSecRaw === "number" && durationSecRaw > 0
+      ? Math.round(durationSecRaw)
+      : undefined;
+
+  if (!base64) {
+    return res.status(400).json({ error: "Нужно передать base64" });
+  }
+
+  const audioBytes = getBase64ByteSize(base64);
+  if (!audioBytes) {
+    return res.status(400).json({ error: "Некорректный base64" });
+  }
+
+  if (audioBytes > MAX_AUDIO_BYTES) {
+    return res
+      .status(400)
+      .json({ error: "Аудио слишком большое. Максимум 18MB" });
+  }
+
+  const allowedMimeTypes = [
+    "audio/aac",
+    "audio/mpeg",
+    "audio/mp3",
+    "audio/mp4",
+    "audio/x-m4a",
+    "audio/webm",
+    "audio/ogg",
+    "audio/wav",
+    "audio/x-wav",
+  ];
+  if (mimeType && !allowedMimeTypes.includes(mimeType)) {
+    return res.status(400).json({ error: "Неподдерживаемый аудио-формат" });
+  }
+
+  try {
+    const extension = getFileExtensionByMimeType(mimeType || "audio/mp4", "m4a");
+    const objectKey = `chat/audio/${req.authUser._id}/${Date.now()}_${crypto.randomBytes(5).toString("hex")}.${extension}`;
+
+    await putBase64ObjectToB2({
+      base64,
+      objectKey,
+      mimeType: mimeType || "audio/mp4",
+    });
+
+    const url = await getSignedObjectUrl(objectKey, CHAT_MEDIA_URL_TTL_SEC);
+
+    return res.status(200).json({
+      objectKey,
+      url,
+      mediaType: "audio",
+      mimeType: mimeType || "audio/mp4",
+      durationSec,
+    });
+  } catch (err) {
+    console.error("❌ Ошибка загрузки аудио:", err.message);
+    return res.status(500).json({ error: "Не удалось загрузить аудио" });
   }
 });
 
@@ -551,7 +737,8 @@ app.get("/api/users/search", authMiddleware, async (req, res) => {
       .sort({ username: 1 })
       .limit(20);
 
-    return res.status(200).json({ users: users.map(sanitizeUser) });
+    const serializedUsers = await Promise.all(users.map((user) => sanitizeUser(user)));
+    return res.status(200).json({ users: serializedUsers });
   } catch (err) {
     console.error("❌ Ошибка поиска пользователей:", err);
     return res
@@ -561,20 +748,13 @@ app.get("/api/users/search", authMiddleware, async (req, res) => {
 });
 
 app.get("/api/chats/direct", authMiddleware, async (req, res) => {
-  console.log("🔄 [CHATS] Запрос списка персональных чатов");
-  const startTime = Date.now();
   try {
     const myUserId = req.authUser._id;
-    console.log(
-      `⏱️  [CHATS] Ищу чаты для пользователя ${req.authUser.username} (${myUserId})...`,
-    );
     const chats = await DirectChat.find({ participants: myUserId }).sort({
       updatedAt: -1,
     });
 
-    const chatsMissingMeta = chats.filter(
-      (chat) => !hasCompleteParticipantsMeta(chat),
-    );
+    const chatsMissingMeta = chats.filter((chat) => !hasCompleteParticipantsMeta(chat));
     const missingUserIds = Array.from(
       new Set(
         chatsMissingMeta.flatMap((chat) =>
@@ -591,54 +771,47 @@ app.get("/api/chats/direct", authMiddleware, async (req, res) => {
       });
     }
 
-    console.log(
-      `⏱️  [CHATS] Загружаю данные пользователей для ${chats.length} чатов...`,
-    );
     const bulkMetaUpdates = [];
-    const preview = chats.map((chat) => {
-      let participantsMeta = hasCompleteParticipantsMeta(chat)
-        ? chat.participantsMeta
-        : buildParticipantsMetaFromMap(chat.participants, usersMap);
+    const preview = await Promise.all(
+      chats.map(async (chat) => {
+        let participantsMeta = hasCompleteParticipantsMeta(chat)
+          ? chat.participantsMeta
+          : buildParticipantsMetaFromMap(chat.participants, usersMap);
 
-      if (!hasCompleteParticipantsMeta(chat) && participantsMeta.length > 0) {
-        bulkMetaUpdates.push({
-          updateOne: {
-            filter: { _id: chat._id },
-            update: { $set: { participantsMeta } },
-          },
-        });
-      }
+        if (!hasCompleteParticipantsMeta(chat) && participantsMeta.length > 0) {
+          bulkMetaUpdates.push({
+            updateOne: {
+              filter: { _id: chat._id },
+              update: { $set: { participantsMeta } },
+            },
+          });
+        }
 
-      const otherParticipant = participantsMeta.find(
-        (entry) => entry.userId.toString() !== myUserId.toString(),
-      );
-      const otherUser = snapshotToClientUser(otherParticipant);
+        const otherParticipant = participantsMeta.find(
+          (entry) => entry.userId.toString() !== myUserId.toString(),
+        );
+        const otherUser = await snapshotToClientUser(otherParticipant);
 
-      if (!otherUser) {
-        return null;
-      }
+        if (!otherUser) {
+          return null;
+        }
 
-      return {
-        chatId: chat.chatId,
-        otherUser,
-        lastMessage: chat.lastMessage || null,
-        updatedAt: chat.updatedAt,
-      };
-    });
+        return {
+          chatId: chat.chatId,
+          otherUser,
+          lastMessage: chat.lastMessage || null,
+          updatedAt: chat.updatedAt,
+        };
+      }),
+    );
 
     if (bulkMetaUpdates.length > 0) {
       await DirectChat.bulkWrite(bulkMetaUpdates, { ordered: false });
     }
 
-    const totalTime = Date.now() - startTime;
-    console.log(
-      `✅ [CHATS] Готово за ${totalTime}ms (найдено ${preview.filter(Boolean).length} чатов)`,
-    );
-
     return res.status(200).json({ chats: preview.filter(Boolean) });
   } catch (err) {
-    const totalTime = Date.now() - startTime;
-    console.error(`❌ [CHATS] Ошибка за ${totalTime}ms:`, err.message);
+    console.error("❌ Ошибка /api/chats/direct:", err.message);
     return res.status(500).json({ error: "Ошибка сервера при загрузке чатов" });
   }
 });
@@ -667,23 +840,17 @@ app.post("/api/chats/direct", authMiddleware, async (req, res) => {
       chat = await DirectChat.create({
         chatId,
         participants: [req.authUser._id, targetUser._id],
-        participantsMeta: [
-          toParticipantSnapshot(req.authUser),
-          toParticipantSnapshot(targetUser),
-        ],
+        participantsMeta: [toParticipantSnapshot(req.authUser), toParticipantSnapshot(targetUser)],
       });
     } else {
       chat.updatedAt = new Date();
-      chat.participantsMeta = [
-        toParticipantSnapshot(req.authUser),
-        toParticipantSnapshot(targetUser),
-      ];
+      chat.participantsMeta = [toParticipantSnapshot(req.authUser), toParticipantSnapshot(targetUser)];
       await chat.save();
     }
 
     return res.status(200).json({
       chatId: chat.chatId,
-      otherUser: sanitizeUser(targetUser),
+      otherUser: await sanitizeUser(targetUser),
     });
   } catch (err) {
     console.error("❌ Ошибка создания персонального чата:", err);
@@ -691,18 +858,13 @@ app.post("/api/chats/direct", authMiddleware, async (req, res) => {
   }
 });
 
-// --- История сообщений (с пагинацией по курсору) ---
 app.get("/api/chats/:chatId/messages", authMiddleware, async (req, res) => {
   const { chatId } = req.params;
   const before = req.query.before ? new Date(req.query.before) : new Date();
-  const limit = Math.min(parseInt(req.query.limit) || 30, 100);
+  const limit = Math.min(parseInt(req.query.limit, 10) || 30, 100);
 
   try {
-    // Только участник чата может читать его сообщения
-    const chat = await DirectChat.findOne({
-      chatId,
-      participants: req.authUser._id,
-    });
+    const chat = await DirectChat.findOne({ chatId, participants: req.authUser._id });
     if (!chat) {
       return res.status(403).json({ error: "Нет доступа к этому чату" });
     }
@@ -710,9 +872,12 @@ app.get("/api/chats/:chatId/messages", authMiddleware, async (req, res) => {
     const messages = await Message.find({ chatId, timestamp: { $lt: before } })
       .sort({ timestamp: -1 })
       .limit(limit)
-      .populate("sender", "username avatar");
+      .populate("sender", "username avatarObjectKey avatar");
 
-    return res.status(200).json({ messages: messages.reverse() });
+    const orderedMessages = messages.reverse();
+    const serialized = await Promise.all(orderedMessages.map((message) => serializeMessageForClient(message)));
+
+    return res.status(200).json({ messages: serialized });
   } catch (err) {
     console.error("❌ Ошибка загрузки сообщений:", err);
     return res
@@ -730,7 +895,7 @@ io.use(async (socket, next) => {
       return next(new Error("Требуется авторизация"));
     }
 
-    socket.data.user = sanitizeUser(user);
+    socket.data.user = await sanitizeUser(user);
     return next();
   } catch (err) {
     console.error("❌ Ошибка socket auth:", err);
@@ -738,7 +903,6 @@ io.use(async (socket, next) => {
   }
 });
 
-// --- ЛОГИКА РАБОТЫ (SOCKET.IO) ---
 io.on("connection", async (socket) => {
   console.log("📱 Подключен:", socket.id, socket.data.user?.username);
 
@@ -753,22 +917,19 @@ io.on("connection", async (socket) => {
     }
   }
 
-  // --- HEARTBEAT: Клиент периодически пингует для обновления активности ---
   socket.on("ping", () => {
-    const userId = socket.data.user?.id?.toString();
-    if (userId) {
-      recordActivity(userId);
+    const pingUserId = socket.data.user?.id?.toString();
+    if (pingUserId) {
+      recordActivity(pingUserId);
     }
   });
 
-  // --- ВХОД В КОМНАТУ ЧАТА ---
   socket.on("joinChat", async (chatId) => {
     try {
-      const userId = socket.data.user?.id?.toString();
-      recordActivity(userId);
+      const joinUserId = socket.data.user?.id?.toString();
+      recordActivity(joinUserId);
 
-      // Только участник чата может войти в комнату
-      const chat = await DirectChat.findOne({ chatId, participants: userId });
+      const chat = await DirectChat.findOne({ chatId, participants: joinUserId });
       if (!chat) {
         socket.emit("error", { message: "Нет доступа к чату" });
         return;
@@ -782,50 +943,47 @@ io.on("connection", async (socket) => {
   });
 
   socket.on("leaveChat", (chatId) => {
-    if (!chatId) {
-      return;
+    if (chatId) {
+      socket.leave(chatId);
     }
-
-    socket.leave(chatId);
   });
 
-  // --- ОТПРАВКА СООБЩЕНИЯ ---
   socket.on("message", async (data) => {
     try {
-      const userId = socket.data.user?.id?.toString();
-      recordActivity(userId);
+      const senderUserId = socket.data.user?.id?.toString();
+      recordActivity(senderUserId);
 
-      if (userId) {
-        await ensureUserOnlineStatus(userId, true);
+      if (senderUserId) {
+        await ensureUserOnlineStatus(senderUserId, true);
       }
 
       const text = (data?.text || "").toString().trim();
       const mediaType = (data?.media?.type || "").toString().trim();
-      const mediaUrl = (data?.media?.url || "").toString().trim();
+      const mediaObjectKey = (data?.media?.objectKey || "").toString().trim();
+      const mediaLegacyUrl = (data?.media?.url || "").toString().trim();
       const mediaMimeType = (data?.media?.mimeType || "").toString().trim();
       const mediaDurationSec =
-        typeof data?.media?.durationSec === "number"
-          ? data.media.durationSec
+        typeof data?.media?.durationSec === "number" && data.media.durationSec > 0
+          ? Math.round(data.media.durationSec)
           : undefined;
 
       if (!data?.chatId) return;
 
       const allowedMediaTypes = ["image", "audio"];
       const hasMedia = Boolean(
-        mediaUrl && allowedMediaTypes.includes(mediaType),
+        allowedMediaTypes.includes(mediaType) && (mediaObjectKey || mediaLegacyUrl),
       );
       if (!text && !hasMedia) return;
 
-      // Только участник может отправлять сообщения в чат
       const chat = await DirectChat.findOne({
         chatId: data.chatId,
-        participants: userId,
+        participants: senderUserId,
       });
       if (!chat) return;
 
       const messageDoc = {
         chatId: data.chatId,
-        sender: userId,
+        sender: senderUserId,
       };
 
       if (text) {
@@ -835,42 +993,29 @@ io.on("connection", async (socket) => {
       if (hasMedia) {
         messageDoc.media = {
           type: mediaType,
-          url: mediaUrl,
+          objectKey: mediaObjectKey || undefined,
+          url: mediaLegacyUrl || undefined,
           mimeType: mediaMimeType || undefined,
           durationSec: mediaDurationSec,
         };
       }
 
       const newMessage = await Message.create(messageDoc);
-      const previewText = buildMessagePreviewText(
-        newMessage.text,
-        newMessage.media?.type,
-      );
-      let participantsMeta = hasCompleteParticipantsMeta(chat)
-        ? chat.participantsMeta
-        : [];
+      const previewText = buildMessagePreviewText(newMessage.text, newMessage.media?.type);
 
+      let participantsMeta = hasCompleteParticipantsMeta(chat) ? chat.participantsMeta : [];
       if (participantsMeta.length === 0) {
-        const participantUsers = await AuthUser.find({
-          _id: { $in: chat.participants },
-        });
+        const participantUsers = await AuthUser.find({ _id: { $in: chat.participants } });
         const participantUsersMap = new Map(
           participantUsers.map((userDoc) => [userDoc._id.toString(), userDoc]),
         );
-        participantsMeta = buildParticipantsMetaFromMap(
-          chat.participants,
-          participantUsersMap,
-        );
+        participantsMeta = buildParticipantsMetaFromMap(chat.participants, participantUsersMap);
 
         if (participantsMeta.length > 0) {
-          await DirectChat.updateOne(
-            { _id: chat._id },
-            { $set: { participantsMeta } },
-          );
+          await DirectChat.updateOne({ _id: chat._id }, { $set: { participantsMeta } });
         }
       }
 
-      // Обновляем мета-данные чата
       await DirectChat.updateOne(
         { chatId: data.chatId },
         {
@@ -880,7 +1025,7 @@ io.on("connection", async (socket) => {
               text: newMessage.text,
               previewText,
               mediaType: newMessage.media?.type,
-              sender: userId,
+              sender: senderUserId,
               timestamp: newMessage.timestamp,
             },
           },
@@ -889,6 +1034,7 @@ io.on("connection", async (socket) => {
 
       const payload = {
         id: newMessage._id,
+        _id: newMessage._id,
         chatId: data.chatId,
         sender: {
           id: socket.data.user.id,
@@ -896,9 +1042,10 @@ io.on("connection", async (socket) => {
           avatar: socket.data.user.avatar,
         },
         text: newMessage.text || "",
-        media: newMessage.media,
+        media: await resolveMessageMediaForClient(newMessage.media),
         timestamp: newMessage.timestamp,
       };
+
       const chatUpdatedBasePayload = {
         chatId: data.chatId,
         updatedAt: newMessage.timestamp,
@@ -906,34 +1053,33 @@ io.on("connection", async (socket) => {
           text: newMessage.text || "",
           previewText,
           mediaType: newMessage.media?.type,
-          sender: userId,
+          sender: senderUserId,
           timestamp: newMessage.timestamp,
         },
       };
 
-      // Рассылаем ТОЛЬКО участникам этого чата
       io.to(data.chatId).emit("message", payload);
 
-      chat.participants.forEach((participantId) => {
-        const participantIdString = participantId.toString();
-        const otherParticipant = participantsMeta.find(
-          (entry) => entry.userId.toString() !== participantIdString,
-        );
-        const otherUser = snapshotToClientUser(otherParticipant);
+      await Promise.all(
+        chat.participants.map(async (participantId) => {
+          const participantIdString = participantId.toString();
+          const otherParticipant = participantsMeta.find(
+            (entry) => entry.userId.toString() !== participantIdString,
+          );
+          const otherUser = await snapshotToClientUser(otherParticipant);
 
-        io.to(buildUserRoomId(participantIdString)).emit("chatUpdated", {
-          ...chatUpdatedBasePayload,
-          otherUser,
-        });
-      });
+          io.to(buildUserRoomId(participantIdString)).emit("chatUpdated", {
+            ...chatUpdatedBasePayload,
+            otherUser,
+          });
+        }),
+      );
     } catch (err) {
       console.error("❌ Ошибка сообщения:", err);
     }
   });
 
   socket.on("disconnect", async () => {
-    console.log("🔌 Отключен");
-
     const disconnectedUserId = socket.data.user?.id?.toString();
     if (!disconnectedUserId) {
       return;
