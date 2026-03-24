@@ -407,6 +407,7 @@ const isExpoPushToken = (value) => {
 
 const sendExpoPushMessages = async (messages) => {
   if (!Array.isArray(messages) || messages.length === 0) {
+    console.log("[push] skip send: no messages prepared");
     return;
   }
 
@@ -419,6 +420,17 @@ const sendExpoPushMessages = async (messages) => {
   for (let index = 0; index < messages.length; index += chunkSize) {
     const chunk = messages.slice(index, index + chunkSize);
 
+    console.log("[push] sending Expo push chunk", {
+      chunkSize: chunk.length,
+      recipients: chunk.map((message) => message.to),
+      payloadPreview: chunk.map((message) => ({
+        to: message.to,
+        title: message.title,
+        body: message.body,
+        chatId: message.data?.chatId,
+      })),
+    });
+
     try {
       const response = await fetch(EXPO_PUSH_API_URL, {
         method: "POST",
@@ -430,9 +442,16 @@ const sendExpoPushMessages = async (messages) => {
         body: JSON.stringify(chunk),
       });
 
+      const responseText = await response.text();
+
+      console.log("[push] Expo Push API response", {
+        status: response.status,
+        ok: response.ok,
+        body: responseText,
+      });
+
       if (!response.ok) {
-        const text = await response.text();
-        console.error("❌ Ошибка Expo Push API:", response.status, text);
+        console.error("❌ Ошибка Expo Push API:", response.status, responseText);
       }
     } catch (err) {
       console.error("❌ Ошибка отправки push-уведомления:", err.message);
@@ -672,13 +691,26 @@ app.patch("/api/users/me", authMiddleware, async (req, res) => {
 app.patch("/api/users/me/push-token", authMiddleware, async (req, res) => {
   const pushToken = (req.body?.pushToken || "").toString().trim();
 
+  console.log("[push] incoming token update request", {
+    userId: req.authUser?._id?.toString?.() || "unknown",
+    username: req.authUser?.username || "unknown",
+    hasToken: Boolean(pushToken),
+    tokenPreview: pushToken ? `${pushToken.slice(0, 20)}...` : "empty",
+  });
+
   if (pushToken && !isExpoPushToken(pushToken)) {
+    console.log("[push] rejected invalid Expo push token", pushToken);
     return res.status(400).json({ error: "Некорректный pushToken" });
   }
 
   try {
     req.authUser.expoPushToken = pushToken;
     await req.authUser.save();
+    console.log("[push] token saved successfully", {
+      userId: req.authUser?._id?.toString?.() || "unknown",
+      username: req.authUser?.username || "unknown",
+      tokenPreview: pushToken ? `${pushToken.slice(0, 20)}...` : "empty",
+    });
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error("❌ Ошибка сохранения push токена:", err);
@@ -1223,6 +1255,23 @@ io.on("connection", async (socket) => {
           .select("_id expoPushToken")
           .lean();
 
+        console.log("[push] evaluating recipients for message", {
+          chatId: data.chatId,
+          senderUserId,
+          recipientIds,
+          recipients: recipients.map((userDoc) => {
+            const userId = userDoc._id.toString();
+            return {
+              userId,
+              hasOpenConnections: (onlineConnections.get(userId) || 0) > 0,
+              hasExpoPushToken: isExpoPushToken(userDoc.expoPushToken),
+              tokenPreview: userDoc.expoPushToken
+                ? `${userDoc.expoPushToken.slice(0, 20)}...`
+                : "empty",
+            };
+          }),
+        });
+
         const pushMessages = recipients
           .filter((userDoc) => {
             const userId = userDoc._id.toString();
@@ -1248,6 +1297,12 @@ io.on("connection", async (socket) => {
               ? { image: socket.data.user.avatar }
               : undefined,
           }));
+
+        console.log("[push] prepared Expo push messages", {
+          count: pushMessages.length,
+          recipients: pushMessages.map((message) => message.to),
+          chatId: data.chatId,
+        });
 
         await sendExpoPushMessages(pushMessages);
       }
