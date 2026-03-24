@@ -28,6 +28,8 @@ const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST", "PATCH"] },
 });
 
+const EXPO_PUSH_API_URL = "https://exp.host/--/api/v2/push/send";
+
 const DEFAULT_AVATAR_URL =
   "https://cdn-icons-png.flaticon.com/512/149/149071.png";
 
@@ -210,6 +212,7 @@ const authUserSchema = new mongoose.Schema(
     avatarObjectKey: { type: String, default: "" },
     // legacy fallback for already stored public URLs
     avatar: { type: String, default: "" },
+    expoPushToken: { type: String, default: "" },
     status: { type: String, enum: ["online", "offline"], default: "offline" },
     createdAt: { type: Date, default: Date.now },
   },
@@ -394,6 +397,46 @@ const getBase64ByteSize = (base64Value) => {
     return Buffer.byteLength(base64Value, "base64");
   } catch {
     return 0;
+  }
+};
+
+const isExpoPushToken = (value) => {
+  const token = (value || "").toString().trim();
+  return /^(ExponentPushToken|ExpoPushToken)\[.+\]$/.test(token);
+};
+
+const sendExpoPushMessages = async (messages) => {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return;
+  }
+
+  if (typeof fetch !== "function") {
+    console.error("❌ fetch недоступен для отправки push-уведомлений");
+    return;
+  }
+
+  const chunkSize = 100;
+  for (let index = 0; index < messages.length; index += chunkSize) {
+    const chunk = messages.slice(index, index + chunkSize);
+
+    try {
+      const response = await fetch(EXPO_PUSH_API_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          "Accept-encoding": "gzip, deflate",
+        },
+        body: JSON.stringify(chunk),
+      });
+
+      if (!response.ok) {
+        const text = await response.text();
+        console.error("❌ Ошибка Expo Push API:", response.status, text);
+      }
+    } catch (err) {
+      console.error("❌ Ошибка отправки push-уведомления:", err.message);
+    }
   }
 };
 
@@ -623,6 +666,25 @@ app.patch("/api/users/me", authMiddleware, async (req, res) => {
     return res
       .status(500)
       .json({ error: "Ошибка сервера при обновлении профиля" });
+  }
+});
+
+app.patch("/api/users/me/push-token", authMiddleware, async (req, res) => {
+  const pushToken = (req.body?.pushToken || "").toString().trim();
+
+  if (pushToken && !isExpoPushToken(pushToken)) {
+    return res.status(400).json({ error: "Некорректный pushToken" });
+  }
+
+  try {
+    req.authUser.expoPushToken = pushToken;
+    await req.authUser.save();
+    return res.status(200).json({ ok: true });
+  } catch (err) {
+    console.error("❌ Ошибка сохранения push токена:", err);
+    return res
+      .status(500)
+      .json({ error: "Ошибка сервера при сохранении push токена" });
   }
 });
 
@@ -1151,6 +1213,42 @@ io.on("connection", async (socket) => {
           });
         }),
       );
+
+      const recipientIds = chat.participants
+        .map((participantId) => participantId.toString())
+        .filter((participantId) => participantId !== senderUserId);
+
+      if (recipientIds.length > 0) {
+        const recipients = await AuthUser.find({ _id: { $in: recipientIds } })
+          .select("_id expoPushToken")
+          .lean();
+
+        const pushMessages = recipients
+          .filter((userDoc) => {
+            const userId = userDoc._id.toString();
+            const hasOpenConnections = (onlineConnections.get(userId) || 0) > 0;
+            return !hasOpenConnections && isExpoPushToken(userDoc.expoPushToken);
+          })
+          .map((userDoc) => ({
+            to: userDoc.expoPushToken,
+            title: socket.data.user.username,
+            body: previewText,
+            data: {
+              chatId: data.chatId,
+              senderId: senderUserId,
+              senderUsername: socket.data.user.username,
+              senderAvatar: socket.data.user.avatar || "",
+            },
+            sound: "default",
+            channelId: "chat-messages",
+            priority: "high",
+            richContent: socket.data.user.avatar
+              ? { image: socket.data.user.avatar }
+              : undefined,
+          }));
+
+        await sendExpoPushMessages(pushMessages);
+      }
     } catch (err) {
       console.error("❌ Ошибка сообщения:", err);
     }
