@@ -6,7 +6,11 @@ const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
 const cors = require("cors");
-const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
+const {
+  S3Client,
+  PutObjectCommand,
+  GetObjectCommand,
+} = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
 const app = express();
@@ -24,7 +28,8 @@ const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST", "PATCH"] },
 });
 
-const DEFAULT_AVATAR_URL = "https://cdn-icons-png.flaticon.com/512/149/149071.png";
+const DEFAULT_AVATAR_URL =
+  "https://cdn-icons-png.flaticon.com/512/149/149071.png";
 
 const B2_KEY_ID = (process.env.B2_KEY_ID || "").trim();
 const B2_APPLICATION_KEY = (process.env.B2_APPLICATION_KEY || "").trim();
@@ -256,7 +261,10 @@ const getOnlineStatusForUser = (userId) => {
 const getAvatarUrlForUser = async (userLike) => {
   if (userLike?.avatarObjectKey) {
     try {
-      const signed = await getSignedObjectUrl(userLike.avatarObjectKey, AVATAR_URL_TTL_SEC);
+      const signed = await getSignedObjectUrl(
+        userLike.avatarObjectKey,
+        AVATAR_URL_TTL_SEC,
+      );
       if (signed) {
         return signed;
       }
@@ -414,9 +422,15 @@ const resolveMessageMediaForClient = async (media) => {
   let signedUrl = null;
   if (media.objectKey) {
     try {
-      signedUrl = await getSignedObjectUrl(media.objectKey, CHAT_MEDIA_URL_TTL_SEC);
+      signedUrl = await getSignedObjectUrl(
+        media.objectKey,
+        CHAT_MEDIA_URL_TTL_SEC,
+      );
     } catch (err) {
-      console.error("❌ Ошибка генерации signed URL для сообщения:", err.message);
+      console.error(
+        "❌ Ошибка генерации signed URL для сообщения:",
+        err.message,
+      );
     }
   }
 
@@ -592,7 +606,8 @@ app.patch("/api/users/me", authMiddleware, async (req, res) => {
       {
         $set: {
           "participantsMeta.$[participant].username": req.authUser.username,
-          "participantsMeta.$[participant].avatarObjectKey": req.authUser.avatarObjectKey,
+          "participantsMeta.$[participant].avatarObjectKey":
+            req.authUser.avatarObjectKey,
           "participantsMeta.$[participant].avatar": "",
           "participantsMeta.$[participant].updatedAt": new Date(),
         },
@@ -644,7 +659,10 @@ app.post("/api/media/image", authMiddleware, async (req, res) => {
   }
 
   try {
-    const extension = getFileExtensionByMimeType(mimeType || "image/jpeg", "jpg");
+    const extension = getFileExtensionByMimeType(
+      mimeType || "image/jpeg",
+      "jpg",
+    );
     const folder = context === "avatar" ? "avatars" : "chat/images";
     const objectKey = `${folder}/${req.authUser._id}/${Date.now()}_${crypto.randomBytes(5).toString("hex")}.${extension}`;
 
@@ -654,7 +672,8 @@ app.post("/api/media/image", authMiddleware, async (req, res) => {
       mimeType: mimeType || "image/jpeg",
     });
 
-    const ttl = context === "avatar" ? AVATAR_URL_TTL_SEC : CHAT_MEDIA_URL_TTL_SEC;
+    const ttl =
+      context === "avatar" ? AVATAR_URL_TTL_SEC : CHAT_MEDIA_URL_TTL_SEC;
     const url = await getSignedObjectUrl(objectKey, ttl);
 
     return res.status(200).json({
@@ -714,7 +733,10 @@ app.post("/api/media/audio", authMiddleware, async (req, res) => {
   }
 
   try {
-    const extension = getFileExtensionByMimeType(mimeType || "audio/mp4", "m4a");
+    const extension = getFileExtensionByMimeType(
+      mimeType || "audio/mp4",
+      "m4a",
+    );
     const objectKey = `chat/audio/${req.authUser._id}/${Date.now()}_${crypto.randomBytes(5).toString("hex")}.${extension}`;
 
     await putBase64ObjectToB2({
@@ -759,7 +781,9 @@ app.get("/api/users/search", authMiddleware, async (req, res) => {
       .sort({ username: 1 })
       .limit(20);
 
-    const serializedUsers = await Promise.all(users.map((user) => sanitizeUser(user)));
+    const serializedUsers = await Promise.all(
+      users.map((user) => sanitizeUser(user)),
+    );
     return res.status(200).json({ users: serializedUsers });
   } catch (err) {
     console.error("❌ Ошибка поиска пользователей:", err);
@@ -776,7 +800,9 @@ app.get("/api/chats/direct", authMiddleware, async (req, res) => {
       updatedAt: -1,
     });
 
-    const chatsMissingMeta = chats.filter((chat) => !hasCompleteParticipantsMeta(chat));
+    const chatsMissingMeta = chats.filter(
+      (chat) => !hasCompleteParticipantsMeta(chat),
+    );
     const missingUserIds = Array.from(
       new Set(
         chatsMissingMeta.flatMap((chat) =>
@@ -862,11 +888,17 @@ app.post("/api/chats/direct", authMiddleware, async (req, res) => {
       chat = await DirectChat.create({
         chatId,
         participants: [req.authUser._id, targetUser._id],
-        participantsMeta: [toParticipantSnapshot(req.authUser), toParticipantSnapshot(targetUser)],
+        participantsMeta: [
+          toParticipantSnapshot(req.authUser),
+          toParticipantSnapshot(targetUser),
+        ],
       });
     } else {
       chat.updatedAt = new Date();
-      chat.participantsMeta = [toParticipantSnapshot(req.authUser), toParticipantSnapshot(targetUser)];
+      chat.participantsMeta = [
+        toParticipantSnapshot(req.authUser),
+        toParticipantSnapshot(targetUser),
+      ];
       await chat.save();
     }
 
@@ -886,7 +918,10 @@ app.get("/api/chats/:chatId/messages", authMiddleware, async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit, 10) || 30, 100);
 
   try {
-    const chat = await DirectChat.findOne({ chatId, participants: req.authUser._id });
+    const chat = await DirectChat.findOne({
+      chatId,
+      participants: req.authUser._id,
+    });
     if (!chat) {
       return res.status(403).json({ error: "Нет доступа к этому чату" });
     }
@@ -897,7 +932,9 @@ app.get("/api/chats/:chatId/messages", authMiddleware, async (req, res) => {
       .populate("sender", "username avatarObjectKey avatar");
 
     const orderedMessages = messages.reverse();
-    const serialized = await Promise.all(orderedMessages.map((message) => serializeMessageForClient(message)));
+    const serialized = await Promise.all(
+      orderedMessages.map((message) => serializeMessageForClient(message)),
+    );
 
     return res.status(200).json({ messages: serialized });
   } catch (err) {
@@ -951,7 +988,10 @@ io.on("connection", async (socket) => {
       const joinUserId = socket.data.user?.id?.toString();
       recordActivity(joinUserId);
 
-      const chat = await DirectChat.findOne({ chatId, participants: joinUserId });
+      const chat = await DirectChat.findOne({
+        chatId,
+        participants: joinUserId,
+      });
       if (!chat) {
         socket.emit("error", { message: "Нет доступа к чату" });
         return;
@@ -985,7 +1025,8 @@ io.on("connection", async (socket) => {
       const mediaLegacyUrl = (data?.media?.url || "").toString().trim();
       const mediaMimeType = (data?.media?.mimeType || "").toString().trim();
       const mediaDurationSec =
-        typeof data?.media?.durationSec === "number" && data.media.durationSec > 0
+        typeof data?.media?.durationSec === "number" &&
+        data.media.durationSec > 0
           ? Math.round(data.media.durationSec)
           : undefined;
 
@@ -993,7 +1034,8 @@ io.on("connection", async (socket) => {
 
       const allowedMediaTypes = ["image", "audio"];
       const hasMedia = Boolean(
-        allowedMediaTypes.includes(mediaType) && (mediaObjectKey || mediaLegacyUrl),
+        allowedMediaTypes.includes(mediaType) &&
+        (mediaObjectKey || mediaLegacyUrl),
       );
       if (!text && !hasMedia) return;
 
@@ -1023,18 +1065,31 @@ io.on("connection", async (socket) => {
       }
 
       const newMessage = await Message.create(messageDoc);
-      const previewText = buildMessagePreviewText(newMessage.text, newMessage.media?.type);
+      const previewText = buildMessagePreviewText(
+        newMessage.text,
+        newMessage.media?.type,
+      );
 
-      let participantsMeta = hasCompleteParticipantsMeta(chat) ? chat.participantsMeta : [];
+      let participantsMeta = hasCompleteParticipantsMeta(chat)
+        ? chat.participantsMeta
+        : [];
       if (participantsMeta.length === 0) {
-        const participantUsers = await AuthUser.find({ _id: { $in: chat.participants } });
+        const participantUsers = await AuthUser.find({
+          _id: { $in: chat.participants },
+        });
         const participantUsersMap = new Map(
           participantUsers.map((userDoc) => [userDoc._id.toString(), userDoc]),
         );
-        participantsMeta = buildParticipantsMetaFromMap(chat.participants, participantUsersMap);
+        participantsMeta = buildParticipantsMetaFromMap(
+          chat.participants,
+          participantUsersMap,
+        );
 
         if (participantsMeta.length > 0) {
-          await DirectChat.updateOne({ _id: chat._id }, { $set: { participantsMeta } });
+          await DirectChat.updateOne(
+            { _id: chat._id },
+            { $set: { participantsMeta } },
+          );
         }
       }
 
