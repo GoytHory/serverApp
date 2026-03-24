@@ -653,8 +653,14 @@ app.post("/api/media/image", authMiddleware, async (req, res) => {
       mediaType: "image",
     });
   } catch (err) {
-    console.error("❌ Ошибка загрузки изображения:", err.message);
-    return res.status(500).json({ error: "Не удалось загрузить изображение" });
+    console.error("❌ Ошибка загрузки изображения:", err);
+    const detailedMessage =
+      err?.message || err?.name || "Неизвестная ошибка загрузки";
+
+    return res.status(500).json({
+      error: "Не удалось загрузить изображение",
+      details: detailedMessage,
+    });
   }
 });
 
@@ -717,8 +723,14 @@ app.post("/api/media/audio", authMiddleware, async (req, res) => {
       durationSec,
     });
   } catch (err) {
-    console.error("❌ Ошибка загрузки аудио:", err.message);
-    return res.status(500).json({ error: "Не удалось загрузить аудио" });
+    console.error("❌ Ошибка загрузки аудио:", err);
+    const detailedMessage =
+      err?.message || err?.name || "Неизвестная ошибка загрузки";
+
+    return res.status(500).json({
+      error: "Не удалось загрузить аудио",
+      details: detailedMessage,
+    });
   }
 });
 
