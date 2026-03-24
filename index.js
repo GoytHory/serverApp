@@ -572,7 +572,9 @@ app.get("/api/chats/direct", authMiddleware, async (req, res) => {
       updatedAt: -1,
     });
 
-    const chatsMissingMeta = chats.filter((chat) => !hasCompleteParticipantsMeta(chat));
+    const chatsMissingMeta = chats.filter(
+      (chat) => !hasCompleteParticipantsMeta(chat),
+    );
     const missingUserIds = Array.from(
       new Set(
         chatsMissingMeta.flatMap((chat) =>
