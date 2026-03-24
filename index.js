@@ -697,6 +697,14 @@ app.get("/api/chats/:chatId/messages", authMiddleware, async (req, res) => {
   const before = req.query.before ? new Date(req.query.before) : new Date();
   const limit = Math.min(parseInt(req.query.limit) || 30, 100);
 
+  console.log("🔄 [MESSAGES] Запрос истории", {
+    chatId,
+    username: req.authUser?.username,
+    userId: req.authUser?._id?.toString(),
+    before: before.toISOString(),
+    limit,
+  });
+
   try {
     // Только участник чата может читать его сообщения
     const chat = await DirectChat.findOne({
@@ -711,6 +719,13 @@ app.get("/api/chats/:chatId/messages", authMiddleware, async (req, res) => {
       .sort({ timestamp: -1 })
       .limit(limit)
       .populate("sender", "username avatar");
+
+    console.log("✅ [MESSAGES] История загружена", {
+      chatId,
+      count: messages.length,
+      firstTimestamp: messages[0]?.timestamp,
+      lastTimestamp: messages[messages.length - 1]?.timestamp,
+    });
 
     return res.status(200).json({ messages: messages.reverse() });
   } catch (err) {
