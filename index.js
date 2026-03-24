@@ -29,7 +29,17 @@ const DEFAULT_AVATAR_URL = "https://cdn-icons-png.flaticon.com/512/149/149071.pn
 const B2_KEY_ID = (process.env.B2_KEY_ID || "").trim();
 const B2_APPLICATION_KEY = (process.env.B2_APPLICATION_KEY || "").trim();
 const B2_BUCKET_NAME = (process.env.B2_BUCKET_NAME || "").trim();
-const B2_ENDPOINT = (process.env.B2_ENDPOINT || "").trim();
+const normalizeEndpoint = (value) => {
+  const raw = (value || "").toString().trim();
+  if (!raw) {
+    return "";
+  }
+
+  const withProtocol = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+  return withProtocol.replace(/\/+$/, "");
+};
+
+const B2_ENDPOINT = normalizeEndpoint(process.env.B2_ENDPOINT);
 const B2_REGION = (process.env.B2_REGION || "").trim();
 
 const parsePositiveInt = (value, fallback) => {
