@@ -79,6 +79,8 @@ const messageSchema = new mongoose.Schema(
   { versionKey: false },
 );
 
+messageSchema.index({ chatId: 1, timestamp: -1 });
+
 const Message = mongoose.model("Message", messageSchema);
 
 // Схема аккаунта для авторизации
@@ -104,6 +106,18 @@ const directChatSchema = new mongoose.Schema(
     participants: [
       { type: mongoose.Schema.Types.ObjectId, ref: "AuthUser", required: true },
     ],
+    participantsMeta: [
+      {
+        userId: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: "AuthUser",
+          required: true,
+        },
+        username: { type: String, required: true },
+        avatar: { type: String, required: true },
+        updatedAt: { type: Date, default: Date.now },
+      },
+    ],
     lastMessage: {
       text: String,
       previewText: String,
@@ -117,6 +131,8 @@ const directChatSchema = new mongoose.Schema(
   { versionKey: false },
 );
 
+directChatSchema.index({ "participantsMeta.userId": 1 });
+
 const DirectChat = mongoose.model("DirectChat", directChatSchema);
 
 const sanitizeUser = (userDoc) => ({
@@ -126,6 +142,53 @@ const sanitizeUser = (userDoc) => ({
   status: userDoc.status,
   createdAt: userDoc.createdAt,
 });
+
+const getOnlineStatusForUser = (userId) => {
+  const onlineCount = onlineConnections.get(userId.toString()) || 0;
+  return onlineCount > 0 ? "online" : "offline";
+};
+
+const toParticipantSnapshot = (userDoc) => ({
+  userId: userDoc._id,
+  username: userDoc.username,
+  avatar: userDoc.avatar,
+  updatedAt: new Date(),
+});
+
+const snapshotToClientUser = (snapshot) => {
+  if (!snapshot?.userId) {
+    return null;
+  }
+
+  return {
+    id: snapshot.userId,
+    username: snapshot.username,
+    avatar: snapshot.avatar,
+    status: getOnlineStatusForUser(snapshot.userId),
+  };
+};
+
+const hasCompleteParticipantsMeta = (chatDoc) => {
+  const participantsMeta = Array.isArray(chatDoc.participantsMeta)
+    ? chatDoc.participantsMeta
+    : [];
+
+  return (
+    participantsMeta.length === chatDoc.participants.length &&
+    participantsMeta.every(
+      (entry) => entry?.userId && entry?.username && entry?.avatar,
+    )
+  );
+};
+
+const buildParticipantsMetaFromMap = (participants, usersMap) => {
+  const snapshots = participants
+    .map((participantId) => usersMap.get(participantId.toString()))
+    .filter(Boolean)
+    .map((userDoc) => toParticipantSnapshot(userDoc));
+
+  return snapshots.length === participants.length ? snapshots : [];
+};
 
 const getUserByToken = async (token) => {
   if (!token || !activeTokens.has(token)) {
@@ -170,6 +233,8 @@ const buildDirectChatId = (firstUserId, secondUserId) => {
   const sortedIds = [firstUserId.toString(), secondUserId.toString()].sort();
   return `dm:${sortedIds[0]}:${sortedIds[1]}`;
 };
+
+const buildUserRoomId = (userId) => `user:${userId.toString()}`;
 
 const ensureUserOnlineStatus = async (userId, isOnline) => {
   try {
@@ -401,6 +466,20 @@ app.patch("/api/users/me", authMiddleware, async (req, res) => {
     req.authUser.avatar = avatar;
     await req.authUser.save();
 
+    await DirectChat.updateMany(
+      { "participantsMeta.userId": req.authUser._id },
+      {
+        $set: {
+          "participantsMeta.$[participant].username": req.authUser.username,
+          "participantsMeta.$[participant].avatar": req.authUser.avatar,
+          "participantsMeta.$[participant].updatedAt": new Date(),
+        },
+      },
+      {
+        arrayFilters: [{ "participant.userId": req.authUser._id }],
+      },
+    );
+
     return res.status(200).json({ user: sanitizeUser(req.authUser) });
   } catch (err) {
     console.error("❌ Ошибка обновления профиля:", err);
@@ -493,31 +572,61 @@ app.get("/api/chats/direct", authMiddleware, async (req, res) => {
       updatedAt: -1,
     });
 
+    const chatsMissingMeta = chats.filter((chat) => !hasCompleteParticipantsMeta(chat));
+    const missingUserIds = Array.from(
+      new Set(
+        chatsMissingMeta.flatMap((chat) =>
+          chat.participants.map((participantId) => participantId.toString()),
+        ),
+      ),
+    );
+
+    const usersMap = new Map();
+    if (missingUserIds.length > 0) {
+      const users = await AuthUser.find({ _id: { $in: missingUserIds } });
+      users.forEach((userDoc) => {
+        usersMap.set(userDoc._id.toString(), userDoc);
+      });
+    }
+
     console.log(
       `⏱️  [CHATS] Загружаю данные пользователей для ${chats.length} чатов...`,
     );
-    const preview = await Promise.all(
-      chats.map(async (chat) => {
-        const otherUserId = chat.participants.find(
-          (id) => id.toString() !== myUserId.toString(),
-        );
-        if (!otherUserId) {
-          return null;
-        }
+    const bulkMetaUpdates = [];
+    const preview = chats.map((chat) => {
+      let participantsMeta = hasCompleteParticipantsMeta(chat)
+        ? chat.participantsMeta
+        : buildParticipantsMetaFromMap(chat.participants, usersMap);
 
-        const otherUser = await AuthUser.findById(otherUserId);
-        if (!otherUser) {
-          return null;
-        }
+      if (!hasCompleteParticipantsMeta(chat) && participantsMeta.length > 0) {
+        bulkMetaUpdates.push({
+          updateOne: {
+            filter: { _id: chat._id },
+            update: { $set: { participantsMeta } },
+          },
+        });
+      }
 
-        return {
-          chatId: chat.chatId,
-          otherUser: sanitizeUser(otherUser),
-          lastMessage: chat.lastMessage || null,
-          updatedAt: chat.updatedAt,
-        };
-      }),
-    );
+      const otherParticipant = participantsMeta.find(
+        (entry) => entry.userId.toString() !== myUserId.toString(),
+      );
+      const otherUser = snapshotToClientUser(otherParticipant);
+
+      if (!otherUser) {
+        return null;
+      }
+
+      return {
+        chatId: chat.chatId,
+        otherUser,
+        lastMessage: chat.lastMessage || null,
+        updatedAt: chat.updatedAt,
+      };
+    });
+
+    if (bulkMetaUpdates.length > 0) {
+      await DirectChat.bulkWrite(bulkMetaUpdates, { ordered: false });
+    }
 
     const totalTime = Date.now() - startTime;
     console.log(
@@ -556,9 +665,17 @@ app.post("/api/chats/direct", authMiddleware, async (req, res) => {
       chat = await DirectChat.create({
         chatId,
         participants: [req.authUser._id, targetUser._id],
+        participantsMeta: [
+          toParticipantSnapshot(req.authUser),
+          toParticipantSnapshot(targetUser),
+        ],
       });
     } else {
       chat.updatedAt = new Date();
+      chat.participantsMeta = [
+        toParticipantSnapshot(req.authUser),
+        toParticipantSnapshot(targetUser),
+      ];
       await chat.save();
     }
 
@@ -625,6 +742,7 @@ io.on("connection", async (socket) => {
 
   const userId = socket.data.user?.id?.toString();
   if (userId) {
+    socket.join(buildUserRoomId(userId));
     recordActivity(userId);
     const count = onlineConnections.get(userId) || 0;
     onlineConnections.set(userId, count + 1);
@@ -659,6 +777,14 @@ io.on("connection", async (socket) => {
     } catch (err) {
       console.error("❌ Ошибка joinChat:", err);
     }
+  });
+
+  socket.on("leaveChat", (chatId) => {
+    if (!chatId) {
+      return;
+    }
+
+    socket.leave(chatId);
   });
 
   // --- ОТПРАВКА СООБЩЕНИЯ ---
@@ -718,6 +844,29 @@ io.on("connection", async (socket) => {
         newMessage.text,
         newMessage.media?.type,
       );
+      let participantsMeta = hasCompleteParticipantsMeta(chat)
+        ? chat.participantsMeta
+        : [];
+
+      if (participantsMeta.length === 0) {
+        const participantUsers = await AuthUser.find({
+          _id: { $in: chat.participants },
+        });
+        const participantUsersMap = new Map(
+          participantUsers.map((userDoc) => [userDoc._id.toString(), userDoc]),
+        );
+        participantsMeta = buildParticipantsMetaFromMap(
+          chat.participants,
+          participantUsersMap,
+        );
+
+        if (participantsMeta.length > 0) {
+          await DirectChat.updateOne(
+            { _id: chat._id },
+            { $set: { participantsMeta } },
+          );
+        }
+      }
 
       // Обновляем мета-данные чата
       await DirectChat.updateOne(
@@ -748,9 +897,33 @@ io.on("connection", async (socket) => {
         media: newMessage.media,
         timestamp: newMessage.timestamp,
       };
+      const chatUpdatedBasePayload = {
+        chatId: data.chatId,
+        updatedAt: newMessage.timestamp,
+        lastMessage: {
+          text: newMessage.text || "",
+          previewText,
+          mediaType: newMessage.media?.type,
+          sender: userId,
+          timestamp: newMessage.timestamp,
+        },
+      };
 
       // Рассылаем ТОЛЬКО участникам этого чата
       io.to(data.chatId).emit("message", payload);
+
+      chat.participants.forEach((participantId) => {
+        const participantIdString = participantId.toString();
+        const otherParticipant = participantsMeta.find(
+          (entry) => entry.userId.toString() !== participantIdString,
+        );
+        const otherUser = snapshotToClientUser(otherParticipant);
+
+        io.to(buildUserRoomId(participantIdString)).emit("chatUpdated", {
+          ...chatUpdatedBasePayload,
+          otherUser,
+        });
+      });
     } catch (err) {
       console.error("❌ Ошибка сообщения:", err);
     }
