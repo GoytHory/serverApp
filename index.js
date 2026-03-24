@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('dotenv').config({ path: require('path').join(__dirname, 'file.env') });
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -12,12 +12,14 @@ const server = http.createServer(app);
 const activeTokens = new Map();
 const onlineConnections = new Map();
 
-app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'] }));
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PATCH', 'OPTIONS'] }));
 app.use(express.json());
 
 const io = new Server(server, {
-  cors: { origin: "*", methods: ["GET", "POST"] }
+  cors: { origin: "*", methods: ["GET", "POST", "PATCH"] }
 });
+
+const IMGBB_API_KEY = (process.env.IMGBB_API_KEY || '').trim();
 
 const mongoURI = process.env.MONGODB_URI;
 mongoose.connect(mongoURI)
@@ -53,7 +55,16 @@ setInterval(cleanupInactiveUsers, 20000);
 const messageSchema = new mongoose.Schema({
   chatId:    { type: String, required: true, index: true },
   sender:    { type: mongoose.Schema.Types.ObjectId, ref: 'AuthUser', required: true },
-  text:      { type: String, required: true },
+  text:      { type: String, default: '' },
+  media: {
+    type: {
+      type: String,
+      enum: ['image', 'audio']
+    },
+    url: String,
+    mimeType: String,
+    durationSec: Number
+  },
   timestamp: { type: Date, default: Date.now }
 }, { versionKey: false });
 
@@ -78,6 +89,8 @@ const directChatSchema = new mongoose.Schema({
   participants: [{ type: mongoose.Schema.Types.ObjectId, ref: 'AuthUser', required: true }],
   lastMessage:  {
     text:      String,
+    previewText: String,
+    mediaType: String,
     sender:    { type: mongoose.Schema.Types.ObjectId, ref: 'AuthUser' },
     timestamp: Date
   },
@@ -147,6 +160,56 @@ const ensureUserOnlineStatus = async (userId, isOnline) => {
   } catch (err) {
     console.error('❌ Ошибка обновления статуса:', err);
   }
+};
+
+const MAX_IMAGE_BASE64_LENGTH = 8 * 1024 * 1024;
+
+const buildMessagePreviewText = (text, mediaType) => {
+  const normalized = (text || '').trim();
+  if (normalized) {
+    return normalized;
+  }
+
+  if (mediaType === 'image') {
+    return 'Изображение';
+  }
+
+  if (mediaType === 'audio') {
+    return 'Голосовое сообщение';
+  }
+
+  return 'Сообщение';
+};
+
+const uploadBase64ToImgBb = async (base64, name) => {
+  if (!IMGBB_API_KEY) {
+    throw new Error('IMGBB API key не настроен');
+  }
+
+  const payload = new URLSearchParams();
+  payload.set('image', base64);
+  if (name) {
+    payload.set('name', name);
+  }
+
+  const response = await fetch(`https://api.imgbb.com/1/upload?key=${encodeURIComponent(IMGBB_API_KEY)}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body: payload.toString()
+  });
+
+  const data = await response.json();
+  if (!response.ok || !data?.success || !data?.data?.url) {
+    throw new Error(data?.error?.message || 'Ошибка загрузки файла в ImgBB');
+  }
+
+  return {
+    url: data.data.url,
+    displayUrl: data.data.display_url,
+    deleteUrl: data.data.delete_url
+  };
 };
 
 app.post('/api/auth/register', async (req, res) => {
@@ -287,6 +350,36 @@ app.patch('/api/users/me', authMiddleware, async (req, res) => {
   } catch (err) {
     console.error('❌ Ошибка обновления профиля:', err);
     return res.status(500).json({ error: 'Ошибка сервера при обновлении профиля' });
+  }
+});
+
+app.post('/api/media/image', authMiddleware, async (req, res) => {
+  const base64 = (req.body?.base64 || '').toString().trim();
+  const mimeType = (req.body?.mimeType || '').toString().trim().toLowerCase();
+  const context = (req.body?.context || 'chat').toString().trim();
+
+  if (!base64) {
+    return res.status(400).json({ error: 'Нужно передать base64' });
+  }
+
+  if (base64.length > MAX_IMAGE_BASE64_LENGTH) {
+    return res.status(400).json({ error: 'Изображение слишком большое' });
+  }
+
+  const allowedMimeTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
+  if (mimeType && !allowedMimeTypes.includes(mimeType)) {
+    return res.status(400).json({ error: 'Неподдерживаемый формат изображения' });
+  }
+
+  try {
+    const uploaded = await uploadBase64ToImgBb(base64, `${context}_${Date.now()}`);
+    return res.status(200).json({
+      url: uploaded.url,
+      displayUrl: uploaded.displayUrl
+    });
+  } catch (err) {
+    console.error('❌ Ошибка загрузки изображения:', err.message);
+    return res.status(500).json({ error: 'Не удалось загрузить изображение' });
   }
 });
 
@@ -487,18 +580,42 @@ io.on('connection', async (socket) => {
         await ensureUserOnlineStatus(userId, true);
       }
 
-      // Ожидаем { text: string, chatId: string }
-      if (!data.text || !data.chatId) return;
+      const text = (data?.text || '').toString().trim();
+      const mediaType = (data?.media?.type || '').toString().trim();
+      const mediaUrl = (data?.media?.url || '').toString().trim();
+      const mediaMimeType = (data?.media?.mimeType || '').toString().trim();
+      const mediaDurationSec = typeof data?.media?.durationSec === 'number' ? data.media.durationSec : undefined;
+
+      if (!data?.chatId) return;
+
+      const allowedMediaTypes = ['image', 'audio'];
+      const hasMedia = Boolean(mediaUrl && allowedMediaTypes.includes(mediaType));
+      if (!text && !hasMedia) return;
 
       // Только участник может отправлять сообщения в чат
       const chat = await DirectChat.findOne({ chatId: data.chatId, participants: userId });
       if (!chat) return;
 
-      const newMessage = await Message.create({
+      const messageDoc = {
         chatId:  data.chatId,
-        sender:  userId,
-        text:    data.text.trim()
-      });
+        sender:  userId
+      };
+
+      if (text) {
+        messageDoc.text = text;
+      }
+
+      if (hasMedia) {
+        messageDoc.media = {
+          type: mediaType,
+          url: mediaUrl,
+          mimeType: mediaMimeType || undefined,
+          durationSec: mediaDurationSec
+        };
+      }
+
+      const newMessage = await Message.create(messageDoc);
+      const previewText = buildMessagePreviewText(newMessage.text, newMessage.media?.type);
 
       // Обновляем мета-данные чата
       await DirectChat.updateOne(
@@ -508,6 +625,8 @@ io.on('connection', async (socket) => {
             updatedAt:   newMessage.timestamp,
             lastMessage: {
               text:      newMessage.text,
+              previewText,
+              mediaType: newMessage.media?.type,
               sender:    userId,
               timestamp: newMessage.timestamp
             }
@@ -523,7 +642,8 @@ io.on('connection', async (socket) => {
           username: socket.data.user.username,
           avatar:   socket.data.user.avatar
         },
-        text:      newMessage.text,
+        text:      newMessage.text || '',
+        media:     newMessage.media,
         timestamp: newMessage.timestamp
       };
 
