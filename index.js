@@ -13,6 +13,9 @@ const activeTokens = new Map();
 const onlineConnections = new Map();
 
 app.use(cors({ origin: "*", methods: ["GET", "POST", "PATCH", "OPTIONS"] }));
+app.get("/health", (req, res) => {
+  res.status(200).json({ ok: true, uptime: process.uptime(), ts: Date.now() });
+});
 app.use(express.json({ limit: "20mb" }));
 
 const io = new Server(server, {
