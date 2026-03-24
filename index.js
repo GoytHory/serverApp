@@ -486,7 +486,9 @@ app.get("/api/chats/direct", authMiddleware, async (req, res) => {
   const startTime = Date.now();
   try {
     const myUserId = req.authUser._id;
-    console.log(`⏱️  [CHATS] Ищу чаты для пользователя ${myUserId}...`);
+    console.log(
+      `⏱️  [CHATS] Ищу чаты для пользователя ${req.authUser.username} (${myUserId})...`,
+    );
     const chats = await DirectChat.find({ participants: myUserId }).sort({
       updatedAt: -1,
     });
