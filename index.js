@@ -12,11 +12,16 @@ const {
   GetObjectCommand,
 } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
+const {
+  evaluatePushEligibility,
+  normalizePresenceState,
+} = require("./pushRouting");
 
 const app = express();
 const server = http.createServer(app);
 const activeTokens = new Map();
 const onlineConnections = new Map();
+const socketPresence = new Map();
 
 app.use(cors({ origin: "*", methods: ["GET", "POST", "PATCH", "OPTIONS"] }));
 app.get("/health", (_req, res) => {
@@ -403,6 +408,29 @@ const getBase64ByteSize = (base64Value) => {
 const isExpoPushToken = (value) => {
   const token = (value || "").toString().trim();
   return /^(ExponentPushToken|ExpoPushToken)\[.+\]$/.test(token);
+};
+
+const getPresenceStateSummary = (userId) => {
+  const normalizedUserId = userId?.toString();
+  if (!normalizedUserId) {
+    return [];
+  }
+
+  const states = [];
+  for (const [socketId, state] of socketPresence.entries()) {
+    if (state.userId !== normalizedUserId) {
+      continue;
+    }
+
+    states.push({
+      socketId,
+      appState: normalizePresenceState(state.appState),
+      activeChatId: state.activeChatId || null,
+      updatedAt: state.updatedAt || 0,
+    });
+  }
+
+  return states;
 };
 
 const sendExpoPushMessages = async (messages) => {
@@ -1061,6 +1089,12 @@ io.on("connection", async (socket) => {
 
   const userId = socket.data.user?.id?.toString();
   if (userId) {
+    socketPresence.set(socket.id, {
+      userId,
+      appState: "active",
+      activeChatId: null,
+      updatedAt: Date.now(),
+    });
     socket.join(buildUserRoomId(userId));
     recordActivity(userId);
     const count = onlineConnections.get(userId) || 0;
@@ -1075,6 +1109,32 @@ io.on("connection", async (socket) => {
     if (pingUserId) {
       recordActivity(pingUserId);
     }
+  });
+
+  socket.on("presence:update", (payload) => {
+    const presenceUserId = socket.data.user?.id?.toString();
+    if (!presenceUserId) {
+      return;
+    }
+
+    const current =
+      socketPresence.get(socket.id) ||
+      ({ userId: presenceUserId, appState: "background", activeChatId: null });
+
+    const nextAppState = normalizePresenceState(payload?.appState);
+    const nextActiveChatId =
+      nextAppState === "active" && typeof payload?.activeChatId === "string"
+        ? payload.activeChatId.trim() || null
+        : null;
+
+    socketPresence.set(socket.id, {
+      userId: presenceUserId,
+      appState: nextAppState,
+      activeChatId: nextActiveChatId,
+      updatedAt: Date.now(),
+    });
+
+    recordActivity(presenceUserId);
   });
 
   socket.on("joinChat", async (chatId) => {
@@ -1092,6 +1152,15 @@ io.on("connection", async (socket) => {
       }
 
       socket.join(chatId);
+      const currentPresence = socketPresence.get(socket.id);
+      if (currentPresence) {
+        socketPresence.set(socket.id, {
+          ...currentPresence,
+          appState: normalizePresenceState(currentPresence.appState),
+          activeChatId: chatId,
+          updatedAt: Date.now(),
+        });
+      }
       console.log(`🚪 ${socket.data.user?.username} вошёл в чат: ${chatId}`);
     } catch (err) {
       console.error("❌ Ошибка joinChat:", err);
@@ -1101,6 +1170,14 @@ io.on("connection", async (socket) => {
   socket.on("leaveChat", (chatId) => {
     if (chatId) {
       socket.leave(chatId);
+      const currentPresence = socketPresence.get(socket.id);
+      if (currentPresence && currentPresence.activeChatId === chatId) {
+        socketPresence.set(socket.id, {
+          ...currentPresence,
+          activeChatId: null,
+          updatedAt: Date.now(),
+        });
+      }
     }
   });
 
@@ -1261,10 +1338,25 @@ io.on("connection", async (socket) => {
           recipientIds,
           recipients: recipients.map((userDoc) => {
             const userId = userDoc._id.toString();
+            const presenceStates = getPresenceStateSummary(userId);
+            const decision = evaluatePushEligibility({
+              expoPushToken: userDoc.expoPushToken,
+              presenceStates,
+              chatId: data.chatId,
+              tokenValidator: isExpoPushToken,
+            });
+
             return {
               userId,
               hasOpenConnections: (onlineConnections.get(userId) || 0) > 0,
+              hasActiveChatOpen: presenceStates.some(
+                (presenceState) =>
+                  presenceState.appState === "active" &&
+                  presenceState.activeChatId === data.chatId,
+              ),
+              presenceStates,
               hasExpoPushToken: isExpoPushToken(userDoc.expoPushToken),
+              pushDecision: decision,
               tokenPreview: userDoc.expoPushToken
                 ? `${userDoc.expoPushToken.slice(0, 20)}...`
                 : "empty",
@@ -1275,10 +1367,14 @@ io.on("connection", async (socket) => {
         const pushMessages = recipients
           .filter((userDoc) => {
             const userId = userDoc._id.toString();
-            const hasOpenConnections = (onlineConnections.get(userId) || 0) > 0;
-            return (
-              !hasOpenConnections && isExpoPushToken(userDoc.expoPushToken)
-            );
+            const presenceStates = getPresenceStateSummary(userId);
+            const decision = evaluatePushEligibility({
+              expoPushToken: userDoc.expoPushToken,
+              presenceStates,
+              chatId: data.chatId,
+              tokenValidator: isExpoPushToken,
+            });
+            return decision.send;
           })
           .map((userDoc) => ({
             to: userDoc.expoPushToken,
@@ -1293,9 +1389,6 @@ io.on("connection", async (socket) => {
             sound: "default",
             channelId: "chat-messages",
             priority: "high",
-            richContent: socket.data.user.avatar
-              ? { image: socket.data.user.avatar }
-              : undefined,
           }));
 
         console.log("[push] prepared Expo push messages", {
@@ -1313,6 +1406,7 @@ io.on("connection", async (socket) => {
 
   socket.on("disconnect", async () => {
     const disconnectedUserId = socket.data.user?.id?.toString();
+    socketPresence.delete(socket.id);
     if (!disconnectedUserId) {
       return;
     }
